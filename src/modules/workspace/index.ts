@@ -6,6 +6,7 @@
  */
 
 import { constants as fsConstants } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
 import { join, resolve, relative, dirname, sep } from 'node:path';
@@ -28,6 +29,8 @@ import type {
   StatusInput,
   MaterializeInput,
   SyncInput,
+  WatchInput,
+  WorkspaceWatch,
   WorkspaceCreatedEvent,
   WorkspaceModifiedEvent,
   WorkspaceDeletedEvent,
@@ -612,6 +615,8 @@ export class WorkspaceModule implements Module {
   private watchers = new Map<string, MountWatcher>();
   /** Chronicle mounts whose saved state says they last ran as direct: sync disk→store before the first materialize. */
   private resyncBeforeMaterialize = new Set<string>();
+  /** Agent-registered path watches, keyed by id. Persisted in module state. */
+  private watches = new Map<string, WorkspaceWatch>();
   /** Persisted state decoded in start(), held until mounts exist to apply it
    *  to — in the Host ordering start() runs before initStore() creates the
    *  mounts, so restoration must be second-callback-safe like watcher
@@ -661,7 +666,7 @@ export class WorkspaceModule implements Module {
     for (const mount of this.config.mounts) {
       const treeStateId = `workspace/${mount.name}/tree`;
       // A direct mount keeps no tree state: disk is the only copy.
-      if (mount.backend !== 'direct') {
+      if ((mount.backend ?? 'direct') !== 'direct') {
         try {
           store.registerState({
             id: treeStateId,
@@ -715,6 +720,10 @@ export class WorkspaceModule implements Module {
    */
   private applySavedState(): void {
     if (!this.savedState || this.mounts.size === 0) return;
+
+    for (const w of this.savedState.watches ?? []) {
+      if (this.mounts.has(w.mount)) this.watches.set(w.id, w);
+    }
 
     for (const [name, meta] of Object.entries(this.savedState.mounts)) {
       const mount = this.mounts.get(name);
@@ -838,38 +847,7 @@ export class WorkspaceModule implements Module {
 
       const watchMode = mount.config.watch ?? 'always';
       if (watchMode === 'always') {
-        const watcher = new MountWatcher(
-          mount.config,
-          (changes) => {
-            this.handleFsChanges(name, changes);
-          },
-          {
-            onReady: () => {
-              mount.watcherReadyAt = Date.now();
-              mount.watcherError = null;
-            },
-            onError: (err) => {
-              mount.watcherError = err.message;
-              this.ctx?.pushEvent({
-                type: 'workspace:watcher-error',
-                mount: name,
-                path: mount.config.path,
-                error: err.message,
-              } as ProcessEvent);
-            },
-            onReattach: () => {
-              mount.watcherError = null;
-              void this.initialScan(name);
-              this.ctx?.pushEvent({
-                type: 'workspace:watcher-reattached',
-                mount: name,
-                path: mount.config.path,
-              } as ProcessEvent);
-            },
-          },
-        );
-        watcher.start();
-        this.watchers.set(name, watcher);
+        this.startWatcher(name, mount);
 
         // A direct mount has no tree to seed; its listings read disk live.
         if (this.isDirect(mount)) continue;
@@ -891,6 +869,48 @@ export class WorkspaceModule implements Module {
     }
   }
 
+  /**
+   * Attach a chokidar watcher to a mount. Called for `watch: 'always'`
+   * mounts at startup, and on demand by the `watch` tool for direct mounts
+   * (no ingest happens there, so a late-started watcher changes nothing but
+   * event delivery).
+   */
+  private startWatcher(name: string, mount: MountState): void {
+    if (this.watchers.has(name)) return;
+    const watcher = new MountWatcher(
+      mount.config,
+      (changes) => {
+        this.handleFsChanges(name, changes);
+      },
+      {
+        onReady: () => {
+          mount.watcherReadyAt = Date.now();
+          mount.watcherError = null;
+        },
+        onError: (err) => {
+          mount.watcherError = err.message;
+          this.ctx?.pushEvent({
+            type: 'workspace:watcher-error',
+            mount: name,
+            path: mount.config.path,
+            error: err.message,
+          } as ProcessEvent);
+        },
+        onReattach: () => {
+          mount.watcherError = null;
+          void this.initialScan(name);
+          this.ctx?.pushEvent({
+            type: 'workspace:watcher-reattached',
+            mount: name,
+            path: mount.config.path,
+          } as ProcessEvent);
+        },
+      },
+    );
+    watcher.start();
+    this.watchers.set(name, watcher);
+  }
+
   private async initialScan(mountName: string): Promise<void> {
     const store = this.store;
     const mount = this.mounts.get(mountName);
@@ -910,22 +930,26 @@ export class WorkspaceModule implements Module {
     }
   }
 
-  async stop(): Promise<void> {
-    // Persist state
-    if (this.ctx) {
-      const activeBranchId = this.store ? this.store.currentBranch().id : undefined;
-      const state: WorkspaceModuleState = { mounts: {}, activeBranchId };
-      for (const [name, mount] of this.mounts) {
-        state.mounts[name] = {
-          lastMaterializedSeq: mount.lastMaterializedSeq,
-          lastMaterializedBranchId: mount.lastMaterializedBranchId ?? undefined,
-          watcherReadyAt: mount.watcherReadyAt,
-          watcherError: mount.watcherError,
-          backend: this.isDirect(mount) ? 'direct' : 'chronicle',
-        };
-      }
-      this.ctx.setState(state);
+  /** Write per-mount metadata and watches to module state. */
+  private persistState(): void {
+    if (!this.ctx) return;
+    const activeBranchId = this.store ? this.store.currentBranch().id : undefined;
+    const state: WorkspaceModuleState = { mounts: {}, activeBranchId };
+    for (const [name, mount] of this.mounts) {
+      state.mounts[name] = {
+        lastMaterializedSeq: mount.lastMaterializedSeq,
+        lastMaterializedBranchId: mount.lastMaterializedBranchId ?? undefined,
+        watcherReadyAt: mount.watcherReadyAt,
+        watcherError: mount.watcherError,
+        backend: this.isDirect(mount) ? 'direct' : 'chronicle',
+      };
     }
+    if (this.watches.size > 0) state.watches = [...this.watches.values()];
+    this.ctx.setState(state);
+  }
+
+  async stop(): Promise<void> {
+    this.persistState();
 
     // Stop watchers
     for (const watcher of this.watchers.values()) {
@@ -1095,6 +1119,25 @@ export class WorkspaceModule implements Module {
           },
         },
       },
+      {
+        name: 'watch',
+        description: 'Watch a file or directory for changes made outside this agent (a shell, another agent, a person). '
+          + 'When a watched path — or anything beneath it — is created, modified or deleted, you are woken with a '
+          + 'context line naming the path and op. Your own writes through these tools do not fire it. '
+          + 'Call with a path to add a watch (same path again updates it); with remove: true and a path or id to '
+          + 'remove one; with no arguments to list. Watches persist across restarts. A direct-backend mount starts '
+          + 'watching on demand; a chronicle mount must have watch: "always" in its recipe.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            path: { type: 'string', description: 'File or directory to watch (mount-prefixed, e.g. "files/inbox"). A bare mount name watches the whole mount.' },
+            ops: { type: 'array', items: { type: 'string', enum: ['created', 'modified', 'deleted'] }, description: 'Ops that fire the watch (default: all)' },
+            note: { type: 'string', description: 'Reminder echoed in the wake line, e.g. "review new tickets"' },
+            remove: { type: 'boolean', description: 'Remove the watch named by id or path' },
+            id: { type: 'string', description: 'Watch id (for remove)' },
+          },
+        },
+      },
     ];
   }
 
@@ -1156,6 +1199,7 @@ export class WorkspaceModule implements Module {
         case 'status': return await this.handleStatus(input as unknown as StatusInput);
         case 'materialize': return await this.handleMaterialize(input as unknown as MaterializeInput);
         case 'sync': return await this.handleSync(input as unknown as SyncInput);
+        case 'watch': return await this.handleWatch(input as unknown as WatchInput);
         default:
           return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
       }
@@ -1176,12 +1220,10 @@ export class WorkspaceModule implements Module {
     const mount = this.mounts.get(mountName);
     if (!mount) return {};
 
-    const flag = mount.config.wakeOnChange;
-    if (!flag) return {};
-
     const op = event.type.slice('workspace:'.length) as WorkspaceFsOp;
+    const flag = mount.config.wakeOnChange;
     const opAllowed = flag === true || (Array.isArray(flag) && flag.includes(op));
-    if (!opAllowed) return {};
+    if (!opAllowed) return this.watchResponse(mountName, op, event);
 
     // Inject a context message so the model actually sees the event.
     // The wake signal alone (requestInference) only starts an inference; the
@@ -1227,6 +1269,100 @@ export class WorkspaceModule implements Module {
           },
         },
       ],
+    };
+  }
+
+  /**
+   * Wake for agent-registered watches: every touched path that sits at or
+   * under a watched path (of a watch that includes this op) produces one
+   * context line. No match, no wake.
+   */
+  private watchResponse(mountName: string, op: WorkspaceFsOp, event: ProcessEvent): EventResponse {
+    if (this.watches.size === 0) return {};
+    const paths = ((event as { paths?: string[] }).paths ?? []).filter(p => typeof p === 'string');
+    const lines: string[] = [];
+    const hit: string[] = [];
+    for (const full of paths) {
+      const rel = full.startsWith(mountName + '/') ? full.slice(mountName.length + 1) : full;
+      for (const w of this.watches.values()) {
+        if (w.mount !== mountName || !w.ops.includes(op)) continue;
+        if (w.path !== '' && rel !== w.path && !rel.startsWith(w.path + '/')) continue;
+        lines.push(`[workspace watch · ${op} · ${full}${w.note ? ` · ${w.note}` : ''}]`);
+        hit.push(w.id);
+        break;
+      }
+    }
+    if (lines.length === 0) return {};
+    return {
+      requestInference: true,
+      addMessages: [{
+        participant: 'user',
+        content: [{ type: 'text', text: lines.join('\n') }],
+        metadata: { source: 'workspace', mount: mountName, op, paths, triggered: true, watches: hit },
+      }],
+    };
+  }
+
+  private async handleWatch(input: WatchInput): Promise<ToolResult> {
+    const list = () => [...this.watches.values()].map(w => ({
+      id: w.id, path: w.path ? `${w.mount}/${w.path}` : w.mount, ops: w.ops, ...(w.note ? { note: w.note } : {}),
+    }));
+
+    if (input.remove) {
+      let target: WorkspaceWatch | undefined;
+      if (input.id) target = this.watches.get(input.id);
+      else if (input.path) {
+        const { mount, relativePath } = this.parsePath(input.path);
+        target = [...this.watches.values()].find(w => w.mount === mount.config.name && w.path === relativePath);
+      } else {
+        return { success: false, error: 'remove needs an id or a path', isError: true };
+      }
+      if (!target) return { success: false, error: `No such watch: ${input.id ?? input.path}`, isError: true };
+      this.watches.delete(target.id);
+      this.persistState();
+      return { success: true, data: { removed: target.id, watches: list() } };
+    }
+
+    if (!input.path) {
+      return { success: true, data: { watches: list(), count: this.watches.size } };
+    }
+
+    const { mount, relativePath } = this.parsePath(input.path);
+    const name = mount.config.name;
+    const ops = (input.ops && input.ops.length > 0 ? input.ops : ['created', 'modified', 'deleted']) as WorkspaceFsOp[];
+    for (const op of ops) {
+      if (!['created', 'modified', 'deleted'].includes(op)) {
+        return { success: false, error: `Unknown op "${op}" — use created, modified or deleted`, isError: true };
+      }
+    }
+
+    if (!this.watchers.has(name)) {
+      if (this.isDirect(mount) && this.ctx) {
+        this.startWatcher(name, mount);
+      } else {
+        const mode = mount.config.watch ?? 'always';
+        return {
+          success: false,
+          error: `Mount "${name}" is not being watched (watch: "${mode}"). Set watch: "always" on the mount in the recipe, `
+            + `or use the direct backend, which starts a watcher on demand.`,
+          isError: true,
+        };
+      }
+    }
+
+    const existing = [...this.watches.values()].find(w => w.mount === name && w.path === relativePath);
+    const watch: WorkspaceWatch = existing
+      ? { ...existing, ops, ...(input.note !== undefined ? { note: input.note } : {}) }
+      : { id: randomBytes(3).toString('hex'), mount: name, path: relativePath, ops, ...(input.note ? { note: input.note } : {}), createdAt: Date.now() };
+    this.watches.set(watch.id, watch);
+    this.persistState();
+    return {
+      success: true,
+      data: {
+        watch: { id: watch.id, path: input.path, ops: watch.ops, ...(watch.note ? { note: watch.note } : {}) },
+        ...(existing ? { updated: true } : {}),
+        note: `You will be woken when ${input.path} ${relativePath ? 'or anything beneath it ' : ''}is ${ops.join('/')} by someone other than you.`,
+      },
     };
   }
 
@@ -1286,6 +1422,15 @@ export class WorkspaceModule implements Module {
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     if (data.byteLength > maxSize) {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
+    }
+    if (this.isDirect(mount)) {
+      try {
+        this.watchers.get(mount.config.name)?.suppress(relativePath);
+        const written = await directWrite(mount, relativePath, mountPrefixedPath, data);
+        return { success: true, data: { path: mountPrefixedPath, size: written.size, mimeType } };
+      } catch (err) {
+        return this.directFailure(err);
+      }
     }
     const store = this.getStore();
     const blobHash = store.storeBlob(data, mimeType);
@@ -1403,7 +1548,7 @@ export class WorkspaceModule implements Module {
   }
 
   private isDirect(mount: MountState): boolean {
-    return mount.config.backend === 'direct';
+    return (mount.config.backend ?? 'direct') === 'direct';
   }
 
   /** The containment-checked opener, bound to a mount, for the direct backend. */
@@ -2009,6 +2154,7 @@ export class WorkspaceModule implements Module {
 
     if (this.isDirect(mount)) {
       try {
+        this.watchers.get(mount.config.name)?.suppress(relativePath);
         const written = await directWrite(mount, relativePath, input.path, Buffer.from(input.content, 'utf-8'), { append: input.append === true });
         return {
           success: true,
@@ -2068,6 +2214,7 @@ export class WorkspaceModule implements Module {
 
     if (this.isDirect(mount)) {
       try {
+        this.watchers.get(mount.config.name)?.suppress(relativePath);
         const edited = await directEdit(mount, relativePath, input.path, this.opener(mount), {
           oldString: input.oldString, newString: input.newString, replaceAll: input.replaceAll,
         });
@@ -2144,6 +2291,7 @@ export class WorkspaceModule implements Module {
 
     if (this.isDirect(mount)) {
       try {
+        this.watchers.get(mount.config.name)?.suppress(relativePath);
         await directDelete(mount, relativePath, input.path);
         return { success: true, data: { path: input.path, deleted: true } };
       } catch (err) {
@@ -2577,7 +2725,7 @@ export class WorkspaceModule implements Module {
   async materializeMount(mountName: string): Promise<string[]> {
     const store = this.getStore();
     const mount = this.mounts.get(mountName);
-    if (!mount || mount.config.mode === 'read-only') return [];
+    if (!mount || mount.config.mode === 'read-only' || this.isDirect(mount)) return [];
 
     // Reset tracking — we're deliberately materializing on the new branch
     mount.lastMaterializedBranchId = null;

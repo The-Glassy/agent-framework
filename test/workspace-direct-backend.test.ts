@@ -96,7 +96,7 @@ test('direct mount: append adds to the end and creates a missing file', async t 
 });
 
 test('chronicle mount: append concatenates in the store', async t => {
-  const { data } = setup(t, [{ name: 'c' }]);
+  const { data } = setup(t, [{ name: 'c', backend: 'chronicle' }]);
   await data('write', { path: 'c/a.txt', content: 'x' });
   const r = await data('write', { path: 'c/a.txt', content: 'y', append: true });
   assert.equal(r.appended, true);
@@ -150,7 +150,7 @@ test('direct mount: ls, glob and grep read the disk — shell creations visible,
 });
 
 test('direct mount: materialize and sync report it as not applicable and never touch its files', async t => {
-  const { root, call, data } = setup(t, [{ name: 'c' }, { name: 'd', backend: 'direct' }]);
+  const { root, call, data } = setup(t, [{ name: 'c', backend: 'chronicle' }, { name: 'd', backend: 'direct' }]);
   const file = join(root, 'd', 'keep.md');
   await data('write', { path: 'd/keep.md', content: 'disk truth\n' });
   appendFileSync(file, 'shell append\n');
@@ -234,7 +234,7 @@ test('switching a mount back from direct to chronicle syncs disk before the firs
   mkdirSync(dir);
   const store = JsStore.openOrCreate({ path: join(root, 'store') });
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const base = { name: 'w', path: dir, mode: 'read-write' as const, watch: 'never' as const };
+  const base = { name: 'w', path: dir, mode: 'read-write' as const, watch: 'never' as const, backend: 'chronicle' as const };
   const run = (name: string, m: WorkspaceModule, input: Record<string, unknown> = {}) => m.handleToolCall({ id: name, name, input });
 
   // 1. Chronicle: write v1 and materialize it.
@@ -282,5 +282,94 @@ test('direct mount with watch: always emits filesystem events without a tree', a
   const created = events.find(e => e.type === 'workspace:created');
   assert.deepEqual(created?.paths, ['d/ext.md']);
   assert.equal(events.some(e => e.type === 'workspace:initial-scan-failed'), false);
+  await module.stop();
+});
+
+test('backend defaults to direct when the mount does not say', async t => {
+  const { root, store, data } = setup(t, [{ name: 'm' }]);
+  const status = (await data('status')).m as Record<string, unknown>;
+  assert.equal(status.backend, 'direct');
+  await data('write', { path: 'm/hello.txt', content: 'hi\n' });
+  assert.equal(readFileSync(join(root, 'm', 'hello.txt'), 'utf-8'), 'hi\n');
+  // No tree state was registered for the mount: nothing was written to a tree.
+  const tree = (() => { try { return store.treeList('workspace/m/tree'); } catch { return []; } })();
+  assert.equal(tree.length, 0);
+});
+
+test('writeBinary and readBinary on a direct mount go straight to disk', async t => {
+  const { root, module } = setup(t, [{ name: 'd' }]);
+  const bytes = Buffer.from([0, 1, 2, 3, 250, 251]);
+  const w = await module.writeBinary('d/blob.bin', bytes, 'application/octet-stream');
+  assert.equal(w.success, true, w.error);
+  assert.deepEqual(readFileSync(join(root, 'd', 'blob.bin')), bytes);
+  const r = await module.readBinary('d/blob.bin');
+  assert.ok('data' in r && r.data.equals(bytes));
+  writeFileSync(join(root, 'd', 'blob.bin'), Buffer.from([9]));
+  const again = await module.readBinary('d/blob.bin');
+  assert.ok('data' in again && again.data.equals(Buffer.from([9])));
+});
+
+test('watch tool: wakes on outside changes under the path, ignores own writes, persists, removes', async t => {
+  // watch: 'never' is what hosts pass by default — the tool starts the watcher on demand for a direct mount.
+  const { root, module, call, data } = setup(t, [{ name: 'd', watch: 'never', watchDebounceMs: 50 }]);
+  const events: Array<{ type: string; paths?: string[]; mount?: string }> = [];
+  let saved: WorkspaceModuleState | undefined;
+  await module.start(makeCtx({ isRestart: false, events, onSave: s => { saved = s; } }));
+  mkdirSync(join(root, 'd', 'inbox'));
+
+  const added = await data('watch', { path: 'd/inbox', note: 'tickets', ops: ['created', 'modified'] });
+  const id = (added.watch as { id: string }).id;
+  assert.match(String(added.note), /woken when d\/inbox or anything beneath it is created\/modified/);
+  assert.equal(saved?.watches?.length, 1);
+
+  const mount = (module as unknown as { mounts: Map<string, MountState> }).mounts.get('d')!;
+  const deadline = Date.now() + 5000;
+  while (mount.watcherReadyAt === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
+  assert.notEqual(mount.watcherReadyAt, null, 'watcher started on demand');
+
+  // The agent's own write is suppressed.
+  await data('write', { path: 'd/inbox/mine.md', content: 'me\n' });
+  await new Promise(r => setTimeout(r, 700));
+  assert.equal(events.filter(e => e.type.startsWith('workspace:') && e.paths?.includes('d/inbox/mine.md')).length, 0);
+
+  // An outside write fires: event → onProcess → wake with a context line.
+  writeFileSync(join(root, 'd', 'inbox', 't1.md'), 'new ticket\n');
+  while (!events.some(e => e.paths?.includes('d/inbox/t1.md')) && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
+  const ev = events.find(e => e.paths?.includes('d/inbox/t1.md'));
+  assert.ok(ev, 'event delivered');
+  const response = await module.onProcess(ev as never, {} as never);
+  assert.equal(response.requestInference, true);
+  const text = (response.addMessages?.[0]?.content as Array<{ text: string }>)[0].text;
+  assert.equal(text, '[workspace watch · created · d/inbox/t1.md · tickets]');
+
+  // Outside the watched path, or an op the watch does not include: no wake.
+  assert.deepEqual(await module.onProcess({ type: 'workspace:created', mount: 'd', paths: ['d/other.md'] } as never, {} as never), {});
+  assert.deepEqual(await module.onProcess({ type: 'workspace:deleted', mount: 'd', paths: ['d/inbox/t1.md'] } as never, {} as never), {});
+
+  const listed = await data('watch');
+  assert.deepEqual(listed.watches, [{ id, path: 'd/inbox', ops: ['created', 'modified'], note: 'tickets' }]);
+
+  // Survives a restart through saved state.
+  const again = new WorkspaceModule({ mounts: [{ name: 'd', path: join(root, 'd'), mode: 'read-write', watch: 'never' }] });
+  again.initStore((module as unknown as { store: JsStore }).store);
+  await again.start(makeCtx({ isRestart: true, saved }));
+  assert.equal(((await again.handleToolCall({ id: 'w', name: 'watch', input: {} })).data as { count: number }).count, 1);
+  await again.stop();
+
+  const removed = await data('watch', { remove: true, path: 'd/inbox' });
+  assert.equal(removed.removed, id);
+  assert.deepEqual(await module.onProcess(ev as never, {} as never), {});
+  const missing = await call('watch', { remove: true, id: 'nope' });
+  assert.equal(missing.success, false);
+  await module.stop();
+});
+
+test('watch tool: a chronicle mount without a watcher is refused with the fix spelled out', async t => {
+  const { module, call } = setup(t, [{ name: 'c', backend: 'chronicle', watch: 'never' }]);
+  await module.start(makeCtx({ isRestart: false }));
+  const r = await call('watch', { path: 'c/notes' });
+  assert.equal(r.success, false);
+  assert.match(r.error ?? '', /watch: "never"/);
+  assert.match(r.error ?? '', /watch: "always"/);
   await module.stop();
 });

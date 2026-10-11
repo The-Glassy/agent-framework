@@ -17,13 +17,15 @@ export interface MountConfig {
   /** Access mode */
   mode: 'read-write' | 'read-only';
   /**
-   * Storage backend for the mount (default: 'chronicle').
-   * - 'chronicle': files live in a Chronicle tree state; disk is a projection
-   *   kept current by `materialize` (store → disk) and `sync` (disk → store).
-   *   Edits are branch-scoped and undoable.
+   * Storage backend for the mount (default: 'direct').
    * - 'direct': every tool call reads and writes the directory itself. No
    *   tree state, nothing to materialize or sync, no copy that can drift
    *   from disk. Edits are not branch-scoped and not undoable.
+   * - 'chronicle': files live in a Chronicle tree state; disk is a projection
+   *   kept current by `materialize` (store → disk) and `sync` (disk → store).
+   *   Edits are branch-scoped and undoable. Choose this when a mount needs
+   *   history that follows the conversation's branches (e.g. a config mount
+   *   the host rewinds with undo/redo).
    */
   backend?: 'chronicle' | 'direct';
   /**
@@ -132,6 +134,26 @@ export interface WorkspaceModuleState {
   }>;
   /** Branch ID considered "active" for materialization */
   activeBranchId?: string;
+  /** Agent-registered path watches (see the `watch` tool). */
+  watches?: WorkspaceWatch[];
+}
+
+/**
+ * A path watch registered through the `watch` tool. Fires (wakes the agent
+ * with a context line) when a filesystem event on the mount touches the path
+ * itself or anything beneath it.
+ */
+export interface WorkspaceWatch {
+  id: string;
+  /** Mount name */
+  mount: string;
+  /** Path relative to the mount root; '' watches the whole mount. */
+  path: string;
+  /** Ops that fire the watch */
+  ops: WorkspaceFsOp[];
+  /** Free-text reminder, echoed in the wake line */
+  note?: string;
+  createdAt: number;
 }
 
 // ============================================================================
@@ -233,6 +255,19 @@ export interface SyncInput {
   path?: string;
   /** Specific mount (optional — defaults to all) */
   mount?: string;
+}
+
+export interface WatchInput {
+  /** File or directory to watch (mount-prefixed). Omit everything to list watches. */
+  path?: string;
+  /** Ops that fire the watch (default: all three) */
+  ops?: WorkspaceFsOp[];
+  /** Reminder echoed in the wake line */
+  note?: string;
+  /** Remove instead of add (by `id` or `path`) */
+  remove?: boolean;
+  /** Watch id, for remove */
+  id?: string;
 }
 
 // ============================================================================
