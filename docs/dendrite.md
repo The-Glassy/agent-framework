@@ -272,9 +272,15 @@ The tune-out coordinator exists whenever MCPL channels do. With a reader (the pe
 
 A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then the reader's report under the reader's own name. Messages still in the deferred queue (held while a turn was alive) are included. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is made durable before the cancel returns.
 
+### The all-except scope
+
+`tune_out` with `scope: 'all-except'` — or its alias `focus` — holds every channel except `channelId`, for `durationSeconds` (mandatory: the scope always ends on its own). It is a resident-level policy epoch, not a per-channel state, so it covers DMs and channels registered after entry: admission's hold lookup asks "is this the exception?", not "is this channel marked?". While it holds, a turn with no delivery of its own speaks into the excepted channel (nissa's reply order: explicit target, waking delivery, focus destination, otherwise private). `mode: 'check'` reports the held count per channel and, with `peek`, one channel's newest held lines without releasing anything. Release is one notice with a per-channel backlog, each capped by `backlogCap`.
+
+Decisions carried from issue #232 and the discussion: a per-channel epoch takes precedence over the scope (its own cadence, budget and stamp); the excepted channel cannot be tuned out, and a tuned-out channel cannot be the exception; the reader keeps its latitude and may end the scope (`cancel_tuneout` on a held channel, or `scope: 'all-except'`); exhausting the reader's wake budget *pauses* reader wakes and leaves the hold in force (traced as `tune-out:wake-budget-paused`); wakes already queued before entry still run; without a reader it is a silent hold; `focus` stays as the alias; closing the excepted channel ends the scope. The record lives in the coordinator's snapshot slot (`tune-out/<resident>/all-except`) and appears in `listPolicyEpochs()` as `{ kind: 'all-except', except }`. A scope whose deadline passed while the process was down is released at resume.
+
 ### Not here
 
-The per-recipient exposure model of nissa's household's proposal (an inbox outside recipient slots, `attention`/`inline` per channel per recipient, overlays), a `ChannelRef` value type, and the all-except scope are not built. Admission here decides per *slot*: residents share one message slot, so a hold applies to all of them, and a reader of the slot sees held traffic through its own view. The structure is the one those designs need — one decision, consumed downstream — so they are additions to the policy inputs, not another path.
+The per-recipient exposure model of nissa's household's proposal (an inbox outside recipient slots, `attention`/`inline` per channel per recipient, overlays), a `ChannelRef` value type, and the mention autoreply (#232 §3.4) are not built. Admission here decides per *slot*: residents share one message slot, so a hold applies to all of them, and a reader of the slot sees held traffic through its own view. The structure is the one those designs need — one decision, consumed downstream — so they are additions to the policy inputs, not another path.
 
 ## The rendering contract
 
@@ -374,7 +380,7 @@ The framework detects these at run time. The registry, lifecycle, attributed mai
 ## What is not implemented
 
 - **Per-recipient exposure.** Admission decides per shared slot, not per recipient (see [Admission](#admission)); the inbox, the `attention`/`inline` settings and overlays of nissa's household's proposal, and a `ChannelRef` value type, are not built.
-- **Focus as the all-except scope.** Tune-out is per channel; the all-except scope (#232 §3.2) is not built yet. The tune-out coordinator still owns epochs and the wake budget; Dendrite supplies the admission decision, the reader and the result route.
+- **The mention autoreply** (#232 §3.4). The tune-out coordinator still owns epochs and the wake budget; Dendrite supplies the admission decision, the reader and the result route.
 - **Live-follow inheritance.** Shared inheritance takes a snapshot. The persistent reader (`reader: 'persistent'`, the default) keeps its live view of the shared slot; the fork reader does not need one, since each fork is derived at the head and handed what arrived since the last look.
 - **Conversation forks on shared inheritance.** They still copy. Moving them needs a decision about their existing stores.
 - **Retiring multi-residency.** Residents still share one message slot.

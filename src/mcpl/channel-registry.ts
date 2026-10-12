@@ -482,12 +482,19 @@ interface ChannelRegistryOptions {
    */
   latestInboundLocus?: boolean;
   /**
-   * A tuned-out channel is being closed by tool: end its epoch through the
-   * cancel flow (release the backlog, record the end) before the lifecycle
-   * state flips to closed. Without this hook the close would discard the
-   * epoch and strand its held messages (issue #232 gap 9).
+   * A channel is being closed by tool: a tuned-out channel's epoch, or an
+   * all-except hold whose exception this is, ends through the cancel flow
+   * (release the backlog, record the end) before the lifecycle state flips
+   * to closed. Without this hook the close would discard the epoch and
+   * strand its held messages (issue #232 gap 9).
    */
-  onCloseTunedOut?: (serverId: string, channelId: string) => void;
+  onToolClose?: (serverId: string, channelId: string) => void;
+  /**
+   * The channel unprefixed speech lands in while an all-except hold is
+   * active (its exception), else null. Consulted after a fork's home and
+   * the turn's own delivery, before the legacy fallback.
+   */
+  focusChannelResolver?: () => string | null;
   /**
    * Called when a text-only turn's speech could NOT be delivered to its
    * conversational locus — no locus, an unregistered channel, a missing
@@ -577,7 +584,8 @@ export class ChannelRegistry {
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
   private readonly latestInboundLocus: boolean;
-  private onCloseTunedOut?: (serverId: string, channelId: string) => void;
+  private onToolClose?: (serverId: string, channelId: string) => void;
+  private focusChannelResolver?: () => string | null;
   private onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
@@ -701,7 +709,8 @@ export class ChannelRegistry {
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
     this.latestInboundLocus = options?.latestInboundLocus === true;
-    this.onCloseTunedOut = options?.onCloseTunedOut;
+    this.onToolClose = options?.onToolClose;
+    this.focusChannelResolver = options?.focusChannelResolver;
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
@@ -1379,7 +1388,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.fallbackLocus();
+    const outgoing = home ?? active ?? this.focusChannelResolver?.() ?? this.fallbackLocus();
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -2713,11 +2722,9 @@ export class ChannelRegistry {
       }
     }
 
-    // A tuned-out channel's epoch ends through the cancel flow — backlog
-    // released, end recorded — never by overwriting the state (#232 gap 9).
-    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out' && this.onCloseTunedOut) {
-      this.onCloseTunedOut(entry.serverId, input.channelId);
-    }
+    // A hold over or around this channel ends through the cancel flow —
+    // backlog released, end recorded — never by overwriting state (#232 gap 9).
+    this.onToolClose?.(entry.serverId, input.channelId);
     if (this.getDesiredState(entry.serverId, input.channelId) !== 'closed') {
       this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     }
@@ -2977,7 +2984,7 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.fallbackLocus();
+    return home ?? this.activeChannelResolver?.(conversationId) ?? this.focusChannelResolver?.() ?? this.fallbackLocus();
   }
 
   /**

@@ -368,8 +368,10 @@ export interface EndOutcome {
 export interface PolicyEpoch {
   id: string;
   kind: 'tune-out' | (string & {});
-  /** What the policy applies to. */
-  scope: { serverId: string; channelId: string };
+  /** What the policy applies to: one channel, or every channel but one. */
+  scope:
+    | { serverId: string; channelId: string }
+    | { kind: 'all-except'; except: { serverId: string; channelId: string } };
   /** The agent whose attention the policy governs. */
   owner?: AgentName;
   /** The agent reading what the policy withholds, if any. */

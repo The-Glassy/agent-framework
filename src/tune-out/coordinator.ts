@@ -60,6 +60,40 @@ export interface ReaderInvocation {
   dispositions: string | null;
 }
 
+/**
+ * The all-except scope (issue #232 §3.2; focus folded into tune-out): a
+ * resident-level policy epoch holding every channel but one, for a bounded
+ * time. It covers DMs and channels registered after entry, since the
+ * decision is "not the exception" rather than a per-channel state.
+ */
+export interface AllExceptParams {
+  epochId: string;
+  except: { serverId: string; channelId: string };
+  cadenceSeconds: number;
+  /** Per held channel, at release. */
+  backlogCap: number;
+  /** Reader wakes before the reader is paused (the hold itself stays). */
+  maxWakes: number;
+  startedAtSequence: number;
+  startedAtMs: number;
+  /** Mandatory: the scope always ends on its own. */
+  expiresAtMs: number;
+  source: string;
+}
+
+export interface AllExceptState {
+  params: AllExceptParams;
+  wakeCount: number;
+}
+
+/** `check`: what is held right now, without releasing anything. */
+export interface TuneOutCheck {
+  allExcept: { epochId: string; except: { serverId: string; channelId: string }; expiresAtMs: number; wakeCount: number; held: Record<string, number> } | null;
+  channels: Array<{ serverId: string; channelId: string; epochId: string; held: number; expiresAtMs?: number }>;
+  /** Up to `peekLimit` newest held lines of the peeked channel, oldest first. */
+  peek?: string[];
+}
+
 export interface TuneOutFrameworkHooks {
   /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
@@ -135,6 +169,10 @@ export class TuneOutCoordinator {
    * the right side to err on.
    */
   private readerCursor = new Map<string, number>();
+  /** The all-except scope's durable record, cached (undefined = not read yet). */
+  private scopeCache: AllExceptState | null | undefined;
+  /** Timer key for the scope's cadence and expiry. */
+  private static readonly SCOPE_KEY = '\0all-except';
 
   constructor(
     private readonly channelRegistry: ChannelRegistry,
@@ -171,6 +209,17 @@ export class TuneOutCoordinator {
       this.armExpiry(serverId, channelId, params);
       if (oldestAnchor === null || params.startedAtSequence < oldestAnchor) {
         oldestAnchor = params.startedAtSequence;
+      }
+    }
+    const scope = this.getAllExcept();
+    if (scope) {
+      if (scope.params.expiresAtMs <= Date.now()) {
+        this.cancelAllExcept('duration', 'duration elapsed');
+      } else {
+        this.armScopeTimers(scope.params);
+        if (oldestAnchor === null || scope.params.startedAtSequence < oldestAnchor) {
+          oldestAnchor = scope.params.startedAtSequence;
+        }
       }
     }
     if (oldestAnchor !== null) {
@@ -219,6 +268,10 @@ export class TuneOutCoordinator {
     }
     if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
       return { ok: false, error: `channel ${channelId} is already tuned out (cancel first to change params)` };
+    }
+    const scope = this.getAllExcept();
+    if (scope && scope.params.except.serverId === serverId && scope.params.except.channelId === channelId) {
+      return { ok: false, error: `channel ${channelId} is the excepted channel of the active all-except hold; cancel that first` };
     }
     const params: TuneOutParams = {
       epochId: randomUUID(),
@@ -401,8 +454,258 @@ export class TuneOutCoordinator {
 
   /** The epoch holding this channel, or null. Pure: the admission stage's lookup. */
   holdFor(serverId: string, channelId: string): { epochId: string } | null {
+    // Precedence: a per-channel epoch keeps its own hold (cadence, budget,
+    // stamp); the all-except scope holds whatever else is not the exception.
     const state = this.channelRegistry.getTuneOutState(serverId, channelId);
-    return state ? { epochId: state.params.epochId } : null;
+    if (state) return { epochId: state.params.epochId };
+    const scope = this.getAllExcept();
+    if (scope && !(scope.params.except.serverId === serverId && scope.params.except.channelId === channelId)) {
+      return { epochId: scope.params.epochId };
+    }
+    return null;
+  }
+
+  /** The channel unprefixed speech lands in while an all-except hold is active, else null. */
+  focusChannel(): string | null {
+    return this.getAllExcept()?.params.except.channelId ?? null;
+  }
+
+  // ==========================================================================
+  // All-except scope
+  // ==========================================================================
+
+  private get scopeStateId(): string {
+    return `tune-out/${this.hooks.primaryName() ?? 'default'}/all-except`;
+  }
+
+  getAllExcept(): AllExceptState | null {
+    if (this.scopeCache !== undefined) return this.scopeCache;
+    try {
+      const raw = this.channelRegistry.readCoordinatorState(this.scopeStateId) as AllExceptState | null;
+      this.scopeCache = raw && typeof raw === 'object' && raw.params && typeof raw.params.epochId === 'string' ? raw : null;
+    } catch {
+      this.scopeCache = null;
+    }
+    return this.scopeCache;
+  }
+
+  private writeScope(state: AllExceptState | null): void {
+    this.scopeCache = state;
+    this.channelRegistry.writeCoordinatorState(this.scopeStateId, state);
+  }
+
+  enterAllExcept(
+    except: { serverId: string; channelId: string },
+    opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
+    source: string,
+  ): { ok: true; params: AllExceptParams } | { ok: false; error: string } {
+    if (typeof opts.durationSeconds !== 'number' || !Number.isFinite(opts.durationSeconds)) {
+      return { ok: false, error: 'an all-except hold needs `durationSeconds`: it always ends on its own' };
+    }
+    if (this.getAllExcept()) {
+      return { ok: false, error: 'an all-except hold is already active (cancel it first)' };
+    }
+    if (this.channelRegistry.getTuneOutState(except.serverId, except.channelId)) {
+      return { ok: false, error: `channel ${except.channelId} is tuned out; it cannot be the exception` };
+    }
+    if (this.hooks.isForkBound(except.channelId)) {
+      return { ok: false, error: `channel ${except.channelId} is bound to a conversation fork` };
+    }
+    const now = Date.now();
+    const params: AllExceptParams = {
+      epochId: randomUUID(),
+      except,
+      cadenceSeconds: Math.max(30, opts.cadenceSeconds ?? TUNE_OUT_DEFAULTS.cadenceSeconds),
+      backlogCap: Math.max(0, opts.backlogCap ?? TUNE_OUT_DEFAULTS.backlogCap),
+      maxWakes: Math.max(1, opts.maxWakes ?? TUNE_OUT_DEFAULTS.maxWakes),
+      startedAtSequence: this.hooks.currentSequence(),
+      startedAtMs: now,
+      expiresAtMs: now + Math.max(60, opts.durationSeconds) * 1000,
+      source,
+    };
+    this.writeScope({ params, wakeCount: 0 });
+    const oldest = this.listActive().reduce((min, e) => Math.min(min, e.params.startedAtSequence), params.startedAtSequence);
+    this.hooks.setSubconsciousAnchor(oldest);
+    this.armScopeTimers(params);
+    this.hooks.emitTrace({
+      type: 'tune-out:entered', serverId: except.serverId, channelId: except.channelId, epochId: params.epochId,
+      scope: 'all-except', reader: this.readerAvailable(), expiresAtMs: params.expiresAtMs,
+    });
+    return { ok: true, params };
+  }
+
+  private armScopeTimers(params: AllExceptParams): void {
+    const key = TuneOutCoordinator.SCOPE_KEY;
+    const expiry = this.expiryTimers.get(key);
+    if (expiry) clearTimeout(expiry);
+    this.expiryTimers.set(key, setTimeout(() => {
+      this.expiryTimers.delete(key);
+      this.cancelAllExcept('duration', 'duration elapsed');
+    }, Math.max(0, params.expiresAtMs - Date.now())));
+    if (!this.readerAvailable()) return;
+    const cadence = this.cadenceTimers.get(key);
+    if (cadence) clearTimeout(cadence);
+    const tick = () => {
+      const scope = this.getAllExcept();
+      if (!scope) return;
+      // One look per held channel with new traffic since the last look.
+      for (const [channelKey, diverted] of this.divertedSinceInvocation) {
+        if (diverted <= 0) continue;
+        const [serverId, channelId] = channelKey.split('\0') as [string, string];
+        if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue; // a per-channel epoch's own cadence
+        this.invokeSubconscious(serverId, channelId, 'cadence', diverted);
+      }
+      this.cadenceTimers.set(key, setTimeout(tick, params.cadenceSeconds * 1000));
+    };
+    this.cadenceTimers.set(key, setTimeout(tick, params.cadenceSeconds * 1000));
+  }
+
+  private clearScopeTimers(): void {
+    const key = TuneOutCoordinator.SCOPE_KEY;
+    const cadence = this.cadenceTimers.get(key);
+    if (cadence) clearTimeout(cadence);
+    this.cadenceTimers.delete(key);
+    const expiry = this.expiryTimers.get(key);
+    if (expiry) clearTimeout(expiry);
+    this.expiryTimers.delete(key);
+  }
+
+  /** Channels held by the scope (not by their own epoch) with the count held under it. */
+  private scopeHeldCounts(epochId: string): Map<string, { serverId: string; channelId: string; count: number }> {
+    const counts = new Map<string, { serverId: string; channelId: string; count: number }>();
+    const all = [...this.hooks.getStoredMessages(), ...(this.hooks.getDeferredMessages?.() ?? [])];
+    for (const m of all) {
+      const meta = m.metadata as { tuneOut?: { epochId?: string }; channelId?: string; serverId?: string } | undefined;
+      if (meta?.tuneOut?.epochId !== epochId) continue;
+      const channelId = typeof meta.channelId === 'string' ? meta.channelId : '(unknown channel)';
+      const serverId = typeof meta.serverId === 'string' ? meta.serverId : '';
+      const k = this.key(serverId, channelId);
+      const entry = counts.get(k) ?? { serverId, channelId, count: 0 };
+      entry.count += 1;
+      counts.set(k, entry);
+    }
+    return counts;
+  }
+
+  /**
+   * End the all-except hold: durable flip, one release notice with a
+   * per-channel backlog (each capped), the reader's note if any, one wake
+   * for the resident, and the reader's own look at what it had not seen.
+   */
+  cancelAllExcept(
+    source: string,
+    reason: string,
+    note?: string,
+    noteAuthor?: string,
+  ): { ok: true } | { ok: false; error: string } {
+    const scope = this.getAllExcept();
+    if (!scope) return { ok: false, error: 'no all-except hold is active' };
+    this.writeScope(null);
+    this.clearScopeTimers();
+    const { epochId, except, backlogCap } = scope.params;
+    for (const [key, pending] of this.pendingWakes) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      if (this.channelRegistry.getTuneOutState(serverId, channelId)) continue;
+      clearTimeout(pending.timer);
+      this.pendingWakes.delete(key);
+    }
+
+    const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
+    const all = [...this.hooks.getStoredMessages().filter(ofEpoch), ...(this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch)];
+    const byChannel = new Map<string, Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>>();
+    for (const m of all) {
+      const channelId = (m.metadata as { channelId?: string } | undefined)?.channelId ?? '(unknown channel)';
+      byChannel.set(channelId, [...(byChannel.get(channelId) ?? []), m]);
+    }
+    const historyTool = this.hooks.historyTool?.() ?? null;
+    const dumps = [...byChannel.entries()].map(([channelId, backlog]) => {
+      const shown = backlogCap > 0 ? backlog.slice(-backlogCap) : [];
+      const truncated = backlog.length - shown.length;
+      const attrs = [
+        `channel="${channelId}"`,
+        `messages=${backlog.length}`,
+        ...(truncated > 0 ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`] : []),
+      ];
+      return `<tuned-out-backlog ${attrs.join(' ')}>\n${shown.map(renderHeldLine).join('\n')}\n</tuned-out-backlog>`;
+    });
+    const summary = byChannel.size === 0
+      ? 'Nothing was held.'
+      : `${all.length} message${all.length === 1 ? '' : 's'} held in ${byChannel.size} channel${byChannel.size === 1 ? '' : 's'}.`;
+    this.hooks.addMessage(
+      'user',
+      [{ type: 'text', text: `[Tune-out: all channels except ${except.channelId} released — ${reason}, ${scope.wakeCount} wake${scope.wakeCount === 1 ? '' : 's'}]\n\n${summary}${dumps.length > 0 ? '\n\n' + dumps.join('\n\n') : ''}` }],
+      { system: true, kind: 'tune-out-cancel', scope: 'all-except', channelId: except.channelId, epochId },
+    );
+    this.hooks.commitDeliveries?.();
+    const subName = this.hooks.subconsciousName();
+    if (note && subName) {
+      this.hooks.addMessage(subName, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
+    } else if (note && noteAuthor && this.hooks.deliverFromReader) {
+      this.hooks.deliverFromReader(noteAuthor, [{ type: 'text', text: note }], { kind: 'subconscious-note', epochId });
+    }
+    const primary = this.hooks.primaryName();
+    if (primary) this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+    if (source !== 'subconscious' && this.readerAvailable()) {
+      const notice = `[Tune-out cancelled: all channels except ${except.channelId} — ${reason}.]`;
+      if (subName) {
+        this.hooks.addMessage('user', [{ type: 'text', text: notice }], { system: true, kind: 'tune-out-cancel-report', scope: 'all-except' }, subName);
+        this.hooks.requestInference(subName, 'tune-out cancelled: all-except', 'tune-out');
+      } else if (this.forkReader) {
+        // One last look per channel the forks had not fully seen.
+        for (const [channelId, backlog] of byChannel) {
+          const serverId = (backlog[0]?.metadata as { serverId?: string } | undefined)?.serverId ?? '';
+          const stored = this.hooks.getStoredMessages().filter((m) => ofEpoch(m) && (m.metadata as { channelId?: string } | undefined)?.channelId === channelId);
+          const cursor = this.readerCursor.get(this.key(serverId, channelId)) ?? -1;
+          if (stored.some((m) => m.sequence > cursor)) {
+            this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, stored);
+          }
+        }
+      }
+    }
+    for (const key of [...this.divertedSinceInvocation.keys()]) {
+      const [serverId, channelId] = key.split('\0') as [string, string];
+      if (!this.channelRegistry.getTuneOutState(serverId, channelId)) {
+        this.divertedSinceInvocation.delete(key);
+        this.readerCursor.delete(key);
+      }
+    }
+    this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
+    return { ok: true };
+  }
+
+  /** What is held right now — per-channel epochs and the scope — without releasing. */
+  check(opts: { peek?: { serverId?: string; channelId: string }; peekLimit?: number } = {}): TuneOutCheck {
+    const stored = this.hooks.getStoredMessages();
+    const deferred = this.hooks.getDeferredMessages?.() ?? [];
+    const countOf = (epochId: string) => [...stored, ...deferred].filter(
+      (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
+    ).length;
+    const channels = this.listActive().map(({ serverId, channelId, params }) => ({
+      serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
+      ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
+    }));
+    const scope = this.getAllExcept();
+    let allExcept: TuneOutCheck['allExcept'] = null;
+    if (scope) {
+      const held: Record<string, number> = {};
+      for (const { channelId, count } of this.scopeHeldCounts(scope.params.epochId).values()) held[channelId] = count;
+      allExcept = { epochId: scope.params.epochId, except: scope.params.except, expiresAtMs: scope.params.expiresAtMs, wakeCount: scope.wakeCount, held };
+    }
+    const result: TuneOutCheck = { allExcept, channels };
+    if (opts.peek) {
+      const limit = Math.max(1, Math.min(50, opts.peekLimit ?? 5));
+      const lines = [...stored, ...deferred]
+        .filter((m) => {
+          const meta = m.metadata as { tuneOut?: unknown; channelId?: string; serverId?: string } | undefined;
+          return !!meta?.tuneOut && meta.channelId === opts.peek!.channelId
+            && (!opts.peek!.serverId || meta.serverId === opts.peek!.serverId);
+        })
+        .slice(-limit)
+        .map(renderHeldLine);
+      result.peek = lines;
+    }
+    return result;
   }
 
   /**
@@ -500,6 +803,14 @@ export class TuneOutCoordinator {
     const timer = setTimeout(() => {
       const entry = this.pendingWakes.get(key);
       this.pendingWakes.delete(key);
+      this.fireWake(serverId, channelId, entry?.count ?? 1);
+    }, WAKE_COALESCE_MS);
+    this.pendingWakes.set(key, { count: 1, timer });
+  }
+
+  /** One coalesced wake: counted durably against the epoch that holds the channel. */
+  private fireWake(serverId: string, channelId: string, count: number): void {
+    if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
       // Count ONE durable wake per coalesced invocation.
       const counted = this.channelRegistry.recordTuneOutWake(serverId, channelId);
       if (!counted) return; // cancelled inside the window
@@ -512,9 +823,24 @@ export class TuneOutCoordinator {
         );
         return;
       }
-      this.invokeSubconscious(serverId, channelId, 'wake', entry?.count ?? 1);
-    }, WAKE_COALESCE_MS);
-    this.pendingWakes.set(key, { count: 1, timer });
+      this.invokeSubconscious(serverId, channelId, 'wake', count);
+      return;
+    }
+    const scope = this.getAllExcept();
+    if (!scope) return; // released inside the window
+    // The all-except scope: exhausting the budget pauses the reader, it does
+    // not end the hold (#232 §3.2 — the hold is the resident's bounded
+    // commitment; the deadline ends it).
+    const wakeCount = scope.wakeCount + 1;
+    this.writeScope({ ...scope, wakeCount });
+    if (wakeCount > scope.params.maxWakes) {
+      this.hooks.emitTrace({
+        type: 'tune-out:wake-budget-paused', epochId: scope.params.epochId, scope: 'all-except',
+        serverId, channelId, wakeCount, maxWakes: scope.params.maxWakes,
+      });
+      return;
+    }
+    this.invokeSubconscious(serverId, channelId, 'wake', count);
   }
 
   /**
@@ -537,16 +863,17 @@ export class TuneOutCoordinator {
       ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
       : `[Tune-out cadence: ${channelId} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
     if (!subName) {
-      const state = this.channelRegistry.getTuneOutState(serverId, channelId);
-      if (!state) return;
+      const hold = this.holdFor(serverId, channelId);
+      if (!hold) return;
       this.invokeReaderFork(
         serverId,
         channelId,
-        state.params.epochId,
+        hold.epochId,
         trigger,
         notice,
         this.hooks.getStoredMessages().filter(
-          (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === state.params.epochId,
+          (m) => (m.metadata as { tuneOut?: { epochId?: string }; channelId?: string } | undefined)?.tuneOut?.epochId === hold.epochId
+            && ((m.metadata as { channelId?: string } | undefined)?.channelId ?? channelId) === channelId,
         ),
       );
       return;
@@ -682,10 +1009,21 @@ export class TuneOutCoordinator {
       }
       case 'cancel_tuneout': {
         const channelId = String(input.channelId ?? '');
-        const located = this.findByChannel(channelId, typeof input.serverId === 'string' ? input.serverId : undefined);
-        if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
-        if ('error' in located) return { success: false, error: located.error, isError: false };
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
+        const located = this.findByChannel(channelId, typeof input.serverId === 'string' ? input.serverId : undefined);
+        if (located && 'error' in located) return { success: false, error: located.error, isError: false };
+        if (!located) {
+          // The reader keeps its latitude over the all-except hold too: a
+          // channel it holds (or the scope named outright) ends the scope.
+          const scope = this.getAllExcept();
+          const heldByScope = scope && (input.scope === 'all-except' || channelId === 'all-except'
+            || (channelId !== '' && this.holdFor(typeof input.serverId === 'string' ? input.serverId : scope.params.except.serverId, channelId)?.epochId === scope.params.epochId));
+          if (!heldByScope) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
+          const result = this.cancelAllExcept('subconscious', 'subconscious judgment', note, caller);
+          return result.ok
+            ? { success: true, data: { cancelled: true, scope: 'all-except' } }
+            : { success: false, error: result.error, isError: false };
+        }
         const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
           ? { success: true, data: { cancelled: true } }

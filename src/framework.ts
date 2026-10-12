@@ -2642,7 +2642,7 @@ export class AgentFramework {
     // array; pushing onto it would append another tune_out on every call.
     const channelTools = [...(this.channelRegistry?.getChannelTools() ?? [])];
     if (this.tuneOutCoordinator && this.tuneOutOffered) {
-      channelTools.push(AgentFramework.TUNE_OUT_TOOL);
+      channelTools.push(AgentFramework.TUNE_OUT_TOOL, AgentFramework.FOCUS_TOOL);
     }
     const gateTools = this.eventGate
       ? [
@@ -4861,6 +4861,18 @@ export class AgentFramework {
         ...(state.params.expiresAtMs !== undefined ? { expiresAtMs: state.params.expiresAtMs } : {}),
       });
     }
+    const scope = this.tuneOutCoordinator?.getAllExcept();
+    if (scope) {
+      epochs.push({
+        id: scope.params.epochId,
+        kind: 'tune-out',
+        scope: { kind: 'all-except', except: scope.params.except },
+        ...(owner ? { owner } : {}),
+        ...(this.subconsciousAgentName ? { reader: this.subconsciousAgentName } : {}),
+        startedAtSequence: scope.params.startedAtSequence,
+        expiresAtMs: scope.params.expiresAtMs,
+      });
+    }
     return epochs;
   }
 
@@ -5540,13 +5552,21 @@ export class AgentFramework {
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
       'tune-out auto-cancels after maxWakes mention-bursts. Without a ' +
       'subconscious it is a silent hold: nothing summarizes or wakes you; ' +
-      'the backlog is delivered when you cancel.',
+      'the backlog is delivered when you cancel. scope "all-except" holds ' +
+      'EVERY channel (DMs and new channels included) except channelId, for ' +
+      'durationSeconds (required); your plain speech lands in that channel ' +
+      'meanwhile; the reader pauses rather than cancels when its wake budget ' +
+      'is spent. mode "check" reports what is held without releasing it ' +
+      '(`peek` shows one channel\'s newest held lines).',
     inputSchema: {
       type: 'object',
       properties: {
-        channelId: { type: 'string' },
+        channelId: { type: 'string', description: 'The channel to tune out — or, with scope "all-except", the one channel to keep.' },
         serverId: { type: 'string', description: 'Required only when the channel id exists on several servers.' },
-        mode: { type: 'string', enum: ['enter', 'cancel'], description: 'Default: enter.' },
+        mode: { type: 'string', enum: ['enter', 'cancel', 'check'], description: 'Default: enter.' },
+        scope: { type: 'string', enum: ['channel', 'all-except'], description: 'Default: channel.' },
+        peek: { type: 'string', description: 'mode "check": a held channel whose newest held lines to show (nothing is released).' },
+        peekLimit: { type: 'number', description: 'mode "check": how many lines to peek (default 5, max 50).' },
         cadenceSeconds: {
           type: 'number',
           description: `Summary cadence in seconds (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}; floors at 30).`,
@@ -5568,7 +5588,33 @@ export class AgentFramework {
             'delivered) after this many seconds; floors at 60. Unset = until cancelled.',
         },
       },
-      required: ['channelId'],
+      required: [],
+    },
+  };
+
+  /** `focus`: the resident-facing alias for `tune_out` with scope "all-except" (#232 decision 2). */
+  private static readonly FOCUS_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'focus',
+    description:
+      'Focus on one channel for a bounded time: every other channel — DMs ' +
+      'and channels that appear later included — is held and stops waking ' +
+      'you; your plain speech lands in the focused channel. The same hold as ' +
+      'tune_out with scope "all-except". mode "cancel" releases the held ' +
+      'backlog per channel; mode "check" reports what is held.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string', description: 'The one channel to keep.' },
+        serverId: { type: 'string' },
+        durationSeconds: { type: 'number', description: 'Required to enter; floors at 60.' },
+        mode: { type: 'string', enum: ['enter', 'cancel', 'check'], description: 'Default: enter.' },
+        cadenceSeconds: { type: 'number' },
+        backlogCap: { type: 'number', description: 'Per held channel, at release.' },
+        maxWakes: { type: 'number' },
+        peek: { type: 'string' },
+        peekLimit: { type: 'number' },
+      },
+      required: [],
     },
   };
 
@@ -13532,7 +13578,7 @@ export class AgentFramework {
     }
 
     // Route the tune-out tool (residents) and the subconscious's surface
-    if (enrichedCall.name === 'tune_out' && this.tuneOutCoordinator) {
+    if ((enrichedCall.name === 'tune_out' || enrichedCall.name === 'focus') && this.tuneOutCoordinator) {
       this.dispatchTuneOutToolCall(agentName, enrichedCall);
       return;
     }
@@ -14439,11 +14485,22 @@ export class AgentFramework {
         },
         shouldTriggerInference: triggerFilter,
         latestInboundLocus: this.speechLocus === 'latest-inbound',
-        // A tool close of a tuned-out channel ends the epoch through the
-        // cancel flow, into the closed state (#232 gap 9).
-        onCloseTunedOut: (serverId, channelId) => {
-          this.tuneOutCoordinator?.cancel(serverId, channelId, 'channel-close', 'channel closed', undefined, undefined, 'closed');
+        // A tool close ends the hold over or around the channel through the
+        // cancel flow (#232 gap 9): a tuned-out channel's epoch into the
+        // closed state; an all-except hold whose exception this is, since
+        // there is nothing left to speak into.
+        onToolClose: (serverId, channelId) => {
+          const coordinator = this.tuneOutCoordinator;
+          if (!coordinator) return;
+          if (this.channelRegistry?.getTuneOutState(serverId, channelId)) {
+            coordinator.cancel(serverId, channelId, 'channel-close', 'channel closed', undefined, undefined, 'closed');
+          }
+          const scope = coordinator.getAllExcept();
+          if (scope && scope.params.except.serverId === serverId && scope.params.except.channelId === channelId) {
+            coordinator.cancelAllExcept('channel-close', 'the excepted channel was closed');
+          }
         },
+        focusChannelResolver: () => this.tuneOutCoordinator?.focusChannel() ?? null,
         // Route a conversation fork's plain-text speech to its HOME channel, not
         // the process-global most-recent-inbound locus (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
@@ -16371,13 +16428,19 @@ export class AgentFramework {
    */
   /** tune_out tool (residents): enter or cancel a channel tune-out. */
   private dispatchTuneOutToolCall(agentName: string, call: ToolCall): void {
+    const input = (call.input ?? {}) as Record<string, unknown>;
     this.queue.push({
       type: 'tool-result',
       callId: call.id,
       agentName,
       moduleName: 'tune-out',
-      result: this.handleTuneOutTool(agentName, (call.input ?? {}) as Record<string, unknown>),
+      result: call.name === 'focus' ? this.handleFocusTool(agentName, input) : this.handleTuneOutTool(agentName, input),
     });
+  }
+
+  /** `focus` is `tune_out` with scope "all-except". */
+  private handleFocusTool(agentName: string, input: Record<string, unknown>) {
+    return this.handleTuneOutTool(agentName, { ...input, scope: 'all-except' });
   }
 
   /**
@@ -16392,18 +16455,50 @@ export class AgentFramework {
     if (!coordinator || !this.channelRegistry) {
       return { success: false, error: 'tune-out is not available (no MCPL channels)', isError: false };
     }
-    const channelId = String(input.channelId ?? '');
-    const resolved = this.channelRegistry.resolveChannel(
-      channelId,
-      typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined,
-    );
-    if ('error' in resolved) return { success: false, error: resolved.error, isError: false };
     const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+    const serverId = typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined;
+    const allExcept = input.scope === 'all-except';
+
+    if (input.mode === 'check') {
+      const peek = typeof input.peek === 'string' && input.peek ? { channelId: input.peek, ...(serverId ? { serverId } : {}) } : undefined;
+      return { success: true, data: coordinator.check({ ...(peek ? { peek } : {}), peekLimit: num(input.peekLimit) }) };
+    }
+    if (input.mode === 'cancel' && (allExcept || (!input.channelId && coordinator.getAllExcept()))) {
+      const r = coordinator.cancelAllExcept('agent-tool', 'agent request');
+      return r.ok ? { success: true, data: { cancelled: 'all-except' } } : { success: false, error: r.error, isError: false };
+    }
+
+    const channelId = String(input.channelId ?? '');
+    const resolved = this.channelRegistry.resolveChannel(channelId, serverId);
+    if ('error' in resolved) return { success: false, error: resolved.error, isError: false };
     if (input.mode === 'cancel') {
       const r = coordinator.cancel(resolved.serverId, resolved.channelId, 'agent-tool', 'agent request');
       return r.ok
         ? { success: true, data: { cancelled: resolved.channelId } }
         : { success: false, error: r.error, isError: false };
+    }
+    if (allExcept) {
+      const r = coordinator.enterAllExcept(resolved, {
+        cadenceSeconds: num(input.cadenceSeconds),
+        backlogCap: num(input.backlogCap),
+        maxWakes: num(input.maxWakes),
+        durationSeconds: num(input.durationSeconds),
+      }, 'agent-tool');
+      if (!r.ok) return { success: false, error: r.error, isError: false };
+      return {
+        success: true,
+        data: {
+          scope: 'all-except',
+          except: resolved.channelId,
+          expiresAtMs: r.params.expiresAtMs,
+          cadenceSeconds: r.params.cadenceSeconds,
+          backlogCap: r.params.backlogCap,
+          maxWakes: r.params.maxWakes,
+          note: coordinator.hasReader()
+            ? 'Your plain speech lands in the excepted channel while this holds. Reader wakes pause, not cancel, when the budget is spent.'
+            : 'No subconscious is configured: this is a silent hold. Your plain speech lands in the excepted channel; the backlog is delivered per channel when you cancel or the duration ends.',
+        },
+      };
     }
     const r = coordinator.enter(resolved.serverId, resolved.channelId, {
       cadenceSeconds: num(input.cadenceSeconds),
