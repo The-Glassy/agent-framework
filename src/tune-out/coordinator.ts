@@ -150,6 +150,13 @@ export interface TuneOutFrameworkHooks {
   isPrivilegedAuthor: (authorId: string | null | undefined) => boolean;
   /** speak_in_channel master switch (recipe-side, canary-gated). */
   allowChannelSpeech: () => boolean;
+  /**
+   * Post a line into a channel under the resident's name. Used for the
+   * all-except scope's entry and release announcements in the excepted
+   * channel (Linn, 2026-10-12: the room should hear the door shut, not
+   * discover it). Absent when `tuneOut.announce` is off.
+   */
+  announce?: (serverId: string, channelId: string, text: string) => Promise<{ success: boolean; error?: string }>;
   emitTrace: (event: { type: string; [key: string]: unknown }) => void;
 }
 
@@ -531,7 +538,37 @@ export class TuneOutCoordinator {
       type: 'tune-out:entered', serverId: except.serverId, channelId: except.channelId, epochId: params.epochId,
       scope: 'all-except', reader: this.readerAvailable(), expiresAtMs: params.expiresAtMs,
     });
+    const minutes = Math.max(1, Math.round((params.expiresAtMs - params.startedAtMs) / 60_000));
+    const until = new Date(params.expiresAtMs).toISOString().slice(11, 16);
+    this.announce(except, params.epochId, 'entered',
+      `[Focus: ${this.hooks.primaryName() ?? 'the resident'} is here for ${minutes} min, until ${until} UTC; other channels are held meanwhile.]`);
     return { ok: true, params };
+  }
+
+  /** Whether entry and release of the all-except scope are announced in the excepted channel. */
+  announces(): boolean {
+    return typeof this.hooks.announce === 'function';
+  }
+
+  /**
+   * The excepted channel hears the scope open and close: one bracketed line
+   * under the resident's name, posted through the same path as a publish.
+   * Fire-and-forget; the outcome is traced, never awaited by the epoch flip.
+   */
+  private announce(
+    target: { serverId: string; channelId: string },
+    epochId: string,
+    kind: 'entered' | 'released',
+    text: string,
+  ): void {
+    if (!this.hooks.announce) return;
+    const base = { serverId: target.serverId, channelId: target.channelId, epochId, kind };
+    this.hooks.announce(target.serverId, target.channelId, text).then(
+      (r) => this.hooks.emitTrace(r.success
+        ? { type: 'tune-out:announced', ...base }
+        : { type: 'tune-out:announce-failed', ...base, error: r.error ?? 'publish failed' }),
+      (err: unknown) => this.hooks.emitTrace({ type: 'tune-out:announce-failed', ...base, error: (err as Error).message }),
+    );
   }
 
   private armScopeTimers(params: AllExceptParams): void {
@@ -671,6 +708,7 @@ export class TuneOutCoordinator {
       }
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId: except.serverId, channelId: except.channelId, epochId, scope: 'all-except', reason, wakeCount: scope.wakeCount });
+    this.announce(except, epochId, 'released', `[Focus: ${primary ?? 'the resident'} released — ${reason}.]`);
     return { ok: true };
   }
 

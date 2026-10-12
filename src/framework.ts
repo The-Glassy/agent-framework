@@ -1343,6 +1343,8 @@ export class AgentFramework {
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
   /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
   private tuneOutOffered = false;
+  /** `tuneOut.announce`: the excepted channel hears the all-except scope open and close. */
+  private tuneOutAnnounce = true;
   /** `speech.locus`: where prose goes when nothing names a destination (see FrameworkConfig). */
   private speechLocus: 'delivery' | 'latest-inbound' = 'delivery';
   /** `subconscious.reader: 'forks'`: the reader is a succession of forks (Dendrite). */
@@ -1778,6 +1780,7 @@ export class AgentFramework {
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
     framework.speechLocus = config.speech?.locus ?? 'delivery';
     framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
+    framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
 
     // What the previous process left in the agent registry. Read before any
     // agent is declared so a restored persistent agent becomes a new
@@ -2048,6 +2051,15 @@ export class AgentFramework {
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
           allowChannelSpeech: () => !!framework.subconsciousConfig?.allowChannelSpeech,
+          ...(framework.tuneOutAnnounce
+            ? {
+                announce: async (_serverId: string, channelId: string, text: string) => {
+                  const r = await framework.channelRegistry!.publishForAgent(
+                    channelId, text, framework.primaryAgentName ?? 'resident');
+                  return { success: r.success, ...(r.error ? { error: r.error } : {}) };
+                },
+              }
+            : {}),
           emitTrace: (e) => framework.emitTrace(e as never),
         },
       );
@@ -16490,6 +16502,7 @@ export class AgentFramework {
         data: {
           scope: 'all-except',
           except: resolved.channelId,
+          announcedIn: coordinator.announces() ? resolved.channelId : null,
           expiresAtMs: r.params.expiresAtMs,
           cadenceSeconds: r.params.cadenceSeconds,
           backlogCap: r.params.backlogCap,

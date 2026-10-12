@@ -196,5 +196,50 @@ describe('tune-out, all-except scope', () => {
       assert.match(textOf(find(f, 'all channels except')), /antra: held/);
     } finally { await f.close(); }
   });
-});
 
+  it('the room hears the door shut: entry and release are announced in the excepted channel; `tuneOut.announce: false` keeps quiet', async () => {
+    const until = async (cond: () => boolean, what: string) => {
+      for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(cond(), what);
+    };
+    const textOfPublish = (p: Record<string, unknown>) =>
+      ((p.content as Array<{ type: string; text?: string }>) ?? []).map((b) => b.text ?? '').join('');
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    const traces: string[] = [];
+    f.framework.onTrace((t) => { traces.push(t.type); });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const entered = internals(f).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
+      assert.ok(entered.success, entered.error);
+      assert.equal((entered.data as { announcedIn?: string | null }).announcedIn, 'work', 'the tool result names where the entry was announced');
+      await until(() => f.published.length >= 1, 'the entry is announced');
+      assert.equal(f.published[0].channelId, 'work');
+      assert.match(textOfPublish(f.published[0]), /^\[Focus: agent is here for 2 min, until \d\d:\d\d UTC; other channels are held meanwhile\.\]$/);
+      await incoming(f, 'noisy', 'n1', 'held');
+      await settle(f);
+      assert.equal(f.published.length, 1, 'a held channel hears nothing');
+
+      assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
+      f.alwaysRespond();
+      await until(() => f.published.length >= 2, 'the release is announced');
+      assert.equal(f.published[1].channelId, 'work');
+      assert.match(textOfPublish(f.published[1]), /^\[Focus: agent released — test\.\]$/);
+      await until(() => traces.filter((t) => t === 'tune-out:announced').length >= 2, 'both announcements traced');
+    } finally { await f.close(); }
+
+    const quiet = await fixture({ framework: { subconscious: SUB, tuneOut: { announce: false } } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(quiet, 'work', 'noisy');
+      const entered = internals(quiet).handleTuneOutTool('agent', { channelId: 'work', scope: 'all-except', durationSeconds: 120 });
+      assert.ok(entered.success, entered.error);
+      assert.equal((entered.data as { announcedIn?: string | null }).announcedIn, null);
+      await incoming(quiet, 'noisy', 'n1', 'held');
+      await settle(quiet);
+      assert.ok(internals(quiet).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
+      quiet.alwaysRespond();
+      await quiet.framework.runUntilIdle();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(quiet.published.length, 0, 'announce: false — nothing is posted');
+    } finally { await quiet.close(); }
+  });
+});

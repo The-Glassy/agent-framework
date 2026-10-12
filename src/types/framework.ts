@@ -125,6 +125,13 @@ export interface FrameworkConfig {
   tuneOut?: {
     /** Offer `tune_out` without a subconscious. Default: only with one. */
     enabled?: boolean;
+    /**
+     * Announce the all-except scope in the excepted channel: one bracketed
+     * line under the resident's name when it opens (who, for how long) and
+     * one when it closes. Default true — a hold the room cannot see is the
+     * failure the scope exists to prevent. `false` keeps both quiet.
+     */
+    announce?: boolean;
   };
 
   /**
