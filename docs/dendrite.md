@@ -303,7 +303,7 @@ The contract was checked against the provider on 10 October 2026 with `bench/den
 | resident, a turn that blocks in a tool call | 0 | 10,230 |
 | **fork derived mid-tool-call, first request** | 152 | **10,230** |
 
-A fork's first request reads everything its parent had cached, including what the parent's latest request added, and writes only its own framing (and, mid-round, the pending round). Message cache breakpoints come from the strategy's recall ladder, so a passthrough resident caches only its system prompt and tools — for resident and fork alike; the same script shows that (1,306 / 1,306) when run without a folding strategy. The script needs `ANTHROPIC_API_KEY`, or `GATE_TOKEN` and `GATE_URL` for a gateway, and prints neither.
+A fork's first request reads everything its parent had cached, including what the parent's latest request added, and writes only its own framing (and, mid-round, the pending round). The read counts grow between requests because the prefix grows, not because more than was cached is reused. Reuse follows the cache markers the strategy actually emits: of the two strategies tested, the autobiographical strategy marks messages (through its recall ladder) and the passthrough strategy marks none, so a passthrough resident caches only its system prompt and tools — for resident and fork alike; the same script shows that (1,306 / 1,306) when run without a folding strategy. This is builder-measured evidence for that model, route and setup; larger stores and other models are separate acceptance cases. The script needs `ANTHROPIC_API_KEY`, or `GATE_TOKEN` and `GATE_URL` for a gateway, and prints neither.
 
 ## Resuming and inspecting
 
