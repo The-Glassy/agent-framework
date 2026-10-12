@@ -33,6 +33,19 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/**
+ * One backlog line: author, then the message's blocks in order — text as
+ * is, anything else named by kind (`[image]`, `[document]`), so a release
+ * never drops a block silently (#232 gap 4).
+ */
+export function renderHeldLine(m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string {
+  const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
+  const parts = m.content.map((b: ContentBlock) =>
+    b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text : `[${b.type}]`,
+  );
+  return `${author}: ${parts.filter((p) => p.length > 0).join(' ')}`;
+}
+
 /** One reader invocation under `reader: 'forks'` (see SubconsciousConfig). */
 export interface ReaderInvocation {
   serverId: string;
@@ -75,6 +88,24 @@ export interface TuneOutFrameworkHooks {
   primaryName: () => string | null;
   /** Read the primary's stored messages (shared slot, unfiltered). */
   getStoredMessages: () => StoredMessage[];
+  /**
+   * Messages admitted for the primary but not yet in its store (deferred
+   * while a turn was alive). A release reads them too, so a message held
+   * mid-turn is in the backlog it belongs to (#232 gap 7).
+   */
+  getDeferredMessages?: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
+  /**
+   * Make what was just delivered durable, including anything the delivery
+   * left in the deferred queue: a release flips durable epoch state, so its
+   * dump must survive a crash in the same window (#232 gap 6).
+   */
+  commitDeliveries?: () => void;
+  /**
+   * The history-reading tool the resident actually has (e.g. a server's
+   * `fetch_history`), or null. A truncation note names it only when it exists
+   * (#232 gap 11).
+   */
+  historyTool?: () => string | null;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /** Move the subconscious window anchor (never forward past active epochs). */
@@ -180,9 +211,9 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string } {
-    if (!this.readerAvailable()) {
-      return { ok: false, error: 'tune-out requires the subconscious resident (framework config `subconscious`)' };
-    }
+    // No reader (issue #232 §3.3): a silent hold. Nothing summarizes, nothing
+    // wakes, mentions are still acknowledged, the backlog is released on
+    // cancel. The resident is told so in the tool result.
     if (this.hooks.isForkBound(channelId)) {
       return { ok: false, error: `channel ${channelId} is bound to a conversation fork; tune-out and fork routing are mutually exclusive` };
     }
@@ -211,9 +242,16 @@ export class TuneOutCoordinator {
     this.hooks.setSubconsciousAnchor(oldest);
 
     this.divertedSinceInvocation.set(this.key(serverId, channelId), 0);
-    this.startCadence(serverId, channelId, params.cadenceSeconds);
-    this.hooks.emitTrace({ type: 'tune-out:entered', serverId, channelId, epochId: params.epochId });
+    if (this.readerAvailable()) this.startCadence(serverId, channelId, params.cadenceSeconds);
+    this.hooks.emitTrace({
+      type: 'tune-out:entered', serverId, channelId, epochId: params.epochId, reader: this.readerAvailable(),
+    });
     return { ok: true, params };
+  }
+
+  /** Whether a reader (persistent subconscious or reader forks) attends holds. */
+  hasReader(): boolean {
+    return this.readerAvailable();
   }
 
   /**
@@ -231,8 +269,10 @@ export class TuneOutCoordinator {
     subconsciousNote?: string,
     /** `reader: 'forks'`: the reader fork whose note this is. */
     noteAuthor?: string,
+    /** The lifecycle state the channel returns to (a tool close ends in 'closed'). */
+    nextState: 'open' | 'closed' = 'open',
   ): { ok: true } | { ok: false; error: string } {
-    const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
+    const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, nextState, source);
     if (!ended) {
       return { ok: false, error: `channel ${channelId} is not tuned out` };
     }
@@ -249,27 +289,27 @@ export class TuneOutCoordinator {
     }
     this.divertedSinceInvocation.delete(this.key(serverId, channelId));
 
-    // Backlog: every message stamped with this epoch, oldest first.
+    // Backlog: every message held under this epoch, oldest first — stored,
+    // and still in the deferred queue (held mid-turn, not yet written).
     const epochId = ended.params.epochId;
-    const backlog = this.hooks.getStoredMessages().filter(
-      (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
-    );
+    const ofEpoch = (m: Pick<StoredMessage, 'metadata'>): boolean =>
+      (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId;
+    const backlog: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [
+      ...this.hooks.getStoredMessages().filter(ofEpoch),
+      ...(this.hooks.getDeferredMessages?.() ?? []).filter(ofEpoch),
+    ];
     const cap = ended.params.backlogCap;
     const shown = cap > 0 ? backlog.slice(-cap) : [];
     const truncated = backlog.length - shown.length;
 
-    const lines = shown.map((m) => {
-      const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
-      const text = m.content
-        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n');
-      return `${author}: ${text}`;
-    });
+    const lines = shown.map(renderHeldLine);
+    const historyTool = this.hooks.historyTool?.() ?? null;
     const attrs = [
       `channel="${channelId}"`,
       `messages=${backlog.length}`,
-      ...(truncated > 0 ? [`truncated=${truncated} (oldest; fetch_history covers the rest)`] : []),
+      ...(truncated > 0
+        ? [`truncated=${truncated} (oldest; ${historyTool ? `${historyTool} covers the rest` : 'not delivered'})`]
+        : []),
     ];
     const dump =
       `<tuned-out-backlog ${attrs.join(' ')}>\n${lines.join('\n')}\n</tuned-out-backlog>`;
@@ -280,6 +320,8 @@ export class TuneOutCoordinator {
       [{ type: 'text', text: `[Tune-out: ${channelId} cancelled — ${reason}, ${ended.wakeCount} wake${ended.wakeCount === 1 ? '' : 's'}]\n\n${dump}` }],
       { system: true, kind: 'tune-out-cancel', channelId, epochId },
     );
+    // The epoch is already ended durably; the release must be as durable.
+    this.hooks.commitDeliveries?.();
     // The subconscious's own words, under its own name, verbatim.
     const subName = this.hooks.subconsciousName();
     if (subconsciousNote && subName) {
@@ -321,7 +363,9 @@ export class TuneOutCoordinator {
       } else if (this.forkReader) {
         // One last fork for the epoch: whatever was held since the last
         // look, plus the cancel notice; its report follows the dump.
-        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, backlog);
+        // The fork is handed stored messages only: a deferred one has no
+        // sequence yet and will reach the store (view-filtered) on its own.
+        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, this.hooks.getStoredMessages().filter(ofEpoch));
       }
     }
     this.readerCursor.delete(this.key(serverId, channelId));
@@ -349,9 +393,32 @@ export class TuneOutCoordinator {
     authorId?: string,
     gatePass = true,
   ): { epochId: string } | null {
-    const state = this.channelRegistry.getTuneOutState(serverId, channelId);
-    if (!state) return null;
+    const hold = this.holdFor(serverId, channelId);
+    if (!hold) return null;
+    this.recordHeld(serverId, channelId, messageId, tags, authorId, gatePass);
+    return hold;
+  }
 
+  /** The epoch holding this channel, or null. Pure: the admission stage's lookup. */
+  holdFor(serverId: string, channelId: string): { epochId: string } | null {
+    const state = this.channelRegistry.getTuneOutState(serverId, channelId);
+    return state ? { epochId: state.params.epochId } : null;
+  }
+
+  /**
+   * Bookkeeping for one held message, after admission decided the hold:
+   * the cadence tally, the deterministic acknowledgement of a suppressed
+   * mention, and the reader wake when the resident's gate would have woken
+   * them (`gatePass` is that verdict, probed without side effects).
+   */
+  recordHeld(
+    serverId: string,
+    channelId: string,
+    messageId: string,
+    tags: string[] | undefined,
+    authorId?: string,
+    gatePass = true,
+  ): void {
     const key = this.key(serverId, channelId);
     this.divertedSinceInvocation.set(key, (this.divertedSinceInvocation.get(key) ?? 0) + 1);
 
@@ -372,10 +439,9 @@ export class TuneOutCoordinator {
       // standing mute to its subject.
       void this.acknowledgeSuppressed(serverId, channelId, messageId);
     }
-    if (gatePass && (addressed || privileged)) {
+    if (gatePass && (addressed || privileged) && this.readerAvailable()) {
       this.scheduleWakeInvocation(serverId, channelId);
     }
-    return { epochId: state.params.epochId };
   }
 
   private async acknowledgeSuppressed(serverId: string, channelId: string, messageId: string): Promise<void> {
@@ -616,8 +682,9 @@ export class TuneOutCoordinator {
       }
       case 'cancel_tuneout': {
         const channelId = String(input.channelId ?? '');
-        const located = this.findByChannel(channelId);
+        const located = this.findByChannel(channelId, typeof input.serverId === 'string' ? input.serverId : undefined);
         if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
+        if ('error' in located) return { success: false, error: located.error, isError: false };
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
         const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
@@ -648,11 +715,16 @@ export class TuneOutCoordinator {
     }
   }
 
-  private findByChannel(channelId: string): { serverId: string } | null {
-    for (const entry of this.listActive()) {
-      if (entry.channelId === channelId) return { serverId: entry.serverId };
+  /** Server-qualified lookup among active epochs; an id on several servers is an error (#232 gap 8). */
+  private findByChannel(channelId: string, serverId?: string): { serverId: string } | { error: string } | null {
+    const matches = this.listActive().filter(
+      (e) => e.channelId === channelId && (!serverId || e.serverId === serverId),
+    );
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      return { error: `channel ${channelId} is tuned out on several servers (${matches.map((m) => m.serverId).join(', ')}); include serverId` };
     }
-    return null;
+    return { serverId: matches[0]!.serverId };
   }
 
   /** Stop all timers (framework shutdown). */

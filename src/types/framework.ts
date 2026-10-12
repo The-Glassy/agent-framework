@@ -115,6 +115,39 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
+   * Tune-out without a reader (issue #232 §3.3). The hold machinery always
+   * runs when MCPL channels exist, so a persisted epoch is resumed and
+   * released whatever the configuration; this switch only decides whether
+   * residents are offered `tune_out` when no reader is configured. Without
+   * a reader a tune-out is a silent hold: no cadence, no wake budget,
+   * mentions are acknowledged, the backlog is released on cancel.
+   */
+  tuneOut?: {
+    /** Offer `tune_out` without a subconscious. Default: only with one. */
+    enabled?: boolean;
+  };
+
+  /**
+   * Where a turn's plain prose lands when nothing names a destination
+   * (architecture channel, 2026-10-06: the §3 carve-out accepted by the
+   * residents).
+   *
+   * - `'delivery'` (default): the locus comes only from the delivery that
+   *   woke the turn, a conversation fork's home channel, or a channel the
+   *   agent opened during the turn. Incoming traffic never moves it — not
+   *   between turns, not mid-turn. A turn with no such locus keeps its
+   *   prose private, and says so in a `[routing]` notice.
+   * - `'latest-inbound'`: the previous rule. The most recent delivered
+   *   inbound message is a global fallback locus for turns without one, and
+   *   an addressed message injected mid-turn re-pins the turn's locus.
+   *
+   * Held traffic never moves the locus under either rule.
+   */
+  speech?: {
+    locus?: 'delivery' | 'latest-inbound';
+  };
+
+  /**
    * IANA zone used only when rendering wall-clock times for the agent.
    * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
    * then the process zone.

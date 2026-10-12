@@ -565,6 +565,28 @@ export type TraceEvent =
       from: string;
       to: string;
       reason: string;
+    })
+  /**
+   * The admission stage's decision for one inbound event (Dendrite §D):
+   * who may receive it, whether it is held (the epoch id) or delivered,
+   * whether it may wake them, and the gate's verdict.
+   */
+  | (TraceEventBase & {
+      type: 'admission:decided';
+      lane: 'channel' | 'push';
+      serverId: string;
+      channelId?: string;
+      messageId: string;
+      recipients: string[];
+      held: string | null;
+      wake: boolean;
+      gatePass: boolean;
+    })
+  /** Batched gate events dropped at delivery because their channel is held now. */
+  | (TraceEventBase & {
+      type: 'gate:held-dropped';
+      dropped: number;
+      channels: Array<string | undefined>;
     });
 
 /**

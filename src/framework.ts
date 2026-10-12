@@ -17,6 +17,7 @@ import {
   type ForkReaderConfig,
 } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, type ReaderInvocation } from './tune-out/coordinator.js';
+import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -978,12 +979,21 @@ interface EphemeralRun {
 }
 
 /**
- * What a reader of the residents' shared message slot does not see:
- * messages stamped at ingestion as diverted by a tune-out. Used by every
- * resident, and by a context derived from one when it is reopened.
+ * The admission record on a stored message: it was held from the residents
+ * by a policy epoch (`metadata.tuneOut = { epochId }`). ONE predicate for
+ * "held from the resident", read by the compiled-view filter and by the
+ * mid-turn injection alike (#232 H1), so the window and the wire agree.
+ */
+export const heldFromResidents = (metadata: Record<string, unknown> | undefined): boolean =>
+  !!(metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+
+/**
+ * What a reader of the residents' shared message slot does not see: held
+ * messages. Used by every resident, and by a context derived from one when
+ * it is reopened.
  */
 const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
-  !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+  !heldFromResidents(message.metadata as Record<string, unknown> | undefined);
 
 /** The context-manager surface shared inheritance needs; absent on versions without derivation. */
 interface DerivingContextManager {
@@ -1331,6 +1341,10 @@ export class AgentFramework {
   private subconsciousConfig: SubconsciousConfig | null = null;
   /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
+  /** Residents are offered `tune_out` (a reader is configured, or `tuneOut.enabled`). */
+  private tuneOutOffered = false;
+  /** `speech.locus`: where prose goes when nothing names a destination (see FrameworkConfig). */
+  private speechLocus: 'delivery' | 'latest-inbound' = 'delivery';
   /** `subconscious.reader: 'forks'`: the reader is a succession of forks (Dendrite). */
   private readerForks = false;
   private readerForkCounter = 0;
@@ -1762,6 +1776,8 @@ export class AgentFramework {
     framework.restoreUsageState();
 
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
+    framework.speechLocus = config.speech?.locus ?? 'delivery';
+    framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
 
     // What the previous process left in the agent registry. Read before any
     // agent is declared so a restored persistent agent becomes a new
@@ -1864,6 +1880,8 @@ export class AgentFramework {
           });
         },
         getAgentNames: () => framework.registry.gateRecipients(),
+        isHeld: (serverId, channelId) =>
+          !!(serverId && channelId && framework.tuneOutCoordinator?.holdFor(serverId, channelId)),
       });
     }
 
@@ -1987,9 +2005,12 @@ export class AgentFramework {
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
-    // Tune-out coordinator (issue #77): needs both the subconscious resident
-    // and the MCPL channel subsystem; created after both exist.
-    if ((framework.subconsciousAgentName || framework.readerForks) && framework.channelRegistry) {
+    // Tune-out coordinator (issue #77, #232 §3.3): the hold machinery exists
+    // whenever MCPL channels do — with a reader (persistent subconscious or
+    // reader forks) it summarizes and wakes; without one it is a silent
+    // hold. Built independently of the reader so a persisted epoch is
+    // always resumed and released (#232 gap 10).
+    if (framework.channelRegistry) {
       framework.tuneOutCoordinator = new TuneOutCoordinator(
         framework.channelRegistry,
         framework.mcplServerRegistry!,
@@ -2014,6 +2035,11 @@ export class AgentFramework {
               ? framework.agents.get(framework.primaryAgentName) : undefined;
             return primary ? primary.getContextManager().getAllMessages() : [];
           },
+          getDeferredMessages: () => framework.deferredMessages
+            .filter((m) => (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName)
+            .map((m) => ({ participant: m.participant, content: m.content, metadata: m.metadata as Record<string, unknown> | undefined })),
+          commitDeliveries: () => framework.commitDeliveries(),
+          historyTool: () => framework.residentHistoryTool(),
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
@@ -2615,7 +2641,7 @@ export class AgentFramework {
     // Copy: getChannelTools() returns the registry's shared definitions
     // array; pushing onto it would append another tune_out on every call.
     const channelTools = [...(this.channelRegistry?.getChannelTools() ?? [])];
-    if (this.tuneOutCoordinator) {
+    if (this.tuneOutCoordinator && this.tuneOutOffered) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
     const gateTools = this.eventGate
@@ -3747,6 +3773,15 @@ export class AgentFramework {
       }
       this.deferredMessages.push(...restored);
       this.deferredWritesPersisted = true;
+      // A tune-out release that was still deferred at the crash owes the
+      // resident the wake its cancel requested (#232 gap 6).
+      for (const m of restored) {
+        if ((m.metadata as { kind?: unknown } | undefined)?.kind !== 'tune-out-cancel') continue;
+        const target = m.forAgent ?? this.primaryAgentName;
+        if (target) {
+          this.pendingRequests.push({ agentName: target, reason: 'tune-out released (restored)', source: 'tune-out', timestamp: Date.now() });
+        }
+      }
       // Rewrite the durable queue without the already-landed entries so a
       // second interrupted boot does not re-scan them.
       if (landed.size > 0) this.persistDeferredWrites();
@@ -5503,11 +5538,14 @@ export class AgentFramework {
       'whether mentions merit interrupting, and able to cancel. People who ' +
       'mention you get an automatic reaction so they know you saw nothing. ' +
       'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
-      'tune-out auto-cancels after maxWakes mention-bursts.',
+      'tune-out auto-cancels after maxWakes mention-bursts. Without a ' +
+      'subconscious it is a silent hold: nothing summarizes or wakes you; ' +
+      'the backlog is delivered when you cancel.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string' },
+        serverId: { type: 'string', description: 'Required only when the channel id exists on several servers.' },
         mode: { type: 'string', enum: ['enter', 'cancel'], description: 'Default: enter.' },
         cadenceSeconds: {
           type: 'number',
@@ -7938,7 +7976,11 @@ export class AgentFramework {
                 const hasToolBlocks = msg.content.some(
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
-                if (!hasToolBlocks && !agent.isOwnParticipant(msg.participant)) {
+                // A held message is stored (the reader has it) and filtered
+                // from the resident's view; injecting it here would put in
+                // the live turn what the next compile hides (#232 gap 5).
+                const heldHere = heldFromResidents(msg.metadata as Record<string, unknown> | undefined);
+                if (!hasToolBlocks && !heldHere && !agent.isOwnParticipant(msg.participant)) {
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -8022,7 +8064,11 @@ export class AgentFramework {
           // classifier-safe D-class from the 2026-07-24 ablation). It also
           // updates lastAnnouncedLocus so the next turn's announce-on-change
           // diffs against what the agent was actually last told.
+          // Under `speech.locus: 'delivery'` (the default) incoming traffic
+          // never moves the locus, mid-turn included: the notice tells the
+          // agent who addressed them, and the reply is theirs to address.
           if (
+            this.speechLocus === 'latest-inbound' &&
             (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
             !shouldEndTurn && !overBudget && currentState.stream
           ) {
@@ -8339,6 +8385,46 @@ export class AgentFramework {
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
 
+    // Admission (Dendrite §D, #232 root cause A): decided once, here, before
+    // anything downstream acts — the hold, the wake gate, who may be woken,
+    // whether this counts as the latest delivered inbound. Every path below
+    // consumes `decision`; none re-asks the policy.
+    const addressed = isAddressedMessage(event.tags, event.metadata);
+    const decision = this.admitInbound({
+      lane: 'channel',
+      serverId: event.serverId,
+      channelId: event.channelId,
+      messageId: event.messageId,
+      authorId: event.author?.id,
+      tags: event.tags,
+      addressed,
+      vetoed: event.triggerInference === false,
+      targetAgents: event.targetAgents,
+      gateContent: event.content
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n'),
+      gateMetadata: {
+        ...event.metadata,
+        eventType: 'mcpl:channel-incoming',
+        serverId: event.serverId,
+        channelId: event.channelId,
+        messageId: event.messageId,
+        threadId: event.threadId,
+        author: event.author,
+        ...(event.tags ? { tags: event.tags } : {}),
+      },
+    });
+    metadata.triggered = decision.wake;
+    if (decision.held) {
+      // The admission record rides the message; the hold's own bookkeeping
+      // (cadence tally, suppressed-mention ack, reader wake) follows.
+      metadata.tuneOut = { epochId: decision.held.epochId };
+      this.tuneOutCoordinator?.recordHeld(
+        event.serverId, event.channelId, event.messageId, event.tags, event.author?.id, decision.gatePass,
+      );
+    }
+
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
     // to the primary conversation.
@@ -8349,7 +8435,6 @@ export class AgentFramework {
       const target = this.agents.get(event.deliverTo);
       if (!target) return undefined;
       if (this.conversationRouter && this.registry.homeChannel(target.name) !== undefined) {
-        metadata.triggered = event.triggerInference ?? false;
         const id = target.getContextManager().addMessage('user', event.content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
@@ -8357,21 +8442,21 @@ export class AgentFramework {
           this.conversationRouter.touch(event.channelId);
         }
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
-        if (event.triggerInference) {
+        if (decision.wake) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
-            addressed: isAddressedMessage(event.tags, event.metadata),
+            addressed,
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
         return { agent: target.name, messageId: id };
       }
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
-      event = { ...event, targetAgents: [target.name] };
+      decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      return this.routeConversationIncoming(event, metadata);
+      return this.routeConversationIncoming(event, metadata, decision);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -8400,37 +8485,17 @@ export class AgentFramework {
       }
     }
 
-    // Tune-out divert (issue #77): stamped, stored, no resident wake. The
-    // coordinator has already handled wake bookkeeping (coalesced
-    // subconscious invocation, durable count, suppression ack) before we
-    // stamp; the subconscious reads the message through its merged view.
-    const divert = this.tuneOutCoordinator?.onIncoming(
-      event.serverId,
-      event.channelId,
-      event.messageId,
-      event.tags,
-      event.author?.id,
-      // The resident's gate verdict rides the event; it preconditions
-      // subconscious wakes (gate composes, it is not replaced).
-      event.triggerInference !== false,
-    ) ?? null;
-    if (divert) {
-      metadata.tuneOut = { epochId: divert.epochId };
-    }
-
+    // Captured where it arrived: a held message is stored with its admission
+    // record and never enters a resident's view; a delivered one is also
+    // the latest delivered inbound (the channel context's `incoming`, and
+    // the fallback locus under the legacy rule) — a held one never is.
     const placement: CoalescingPlacement = { agent: '' };
     const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+    if (decision.locus) this.channelRegistry?.noteDelivered(event.channelId, event.messageId, event.threadId);
 
-    if (event.triggerInference && !divert) {
-      const addressed = isAddressedMessage(event.tags, event.metadata);
-      // Honor explicit targeting, mirroring the push-event path: an event
-      // that names its agents wakes exactly those; an untargeted event
-      // keeps the historical broadcast. (targetAgents was declared on
-      // McplChannelIncomingEvent from the start but never honored here —
-      // tune-out's wake routing is the first setter.)
-      const targetAgents = event.targetAgents ?? this.registry.untargetedRecipients();
-      for (const agentName of targetAgents) {
+    if (decision.wake) {
+      for (const agentName of decision.recipients) {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
           agentName,
@@ -8470,6 +8535,7 @@ export class AgentFramework {
       coalescingSubject?: string;
     },
     messageMetadata: Record<string, unknown>,
+    admission: AdmissionDecision,
   ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
@@ -8528,9 +8594,9 @@ export class AgentFramework {
       }
     }
 
-    // Respect an explicit server-config-level veto (shouldTriggerInference)
-    // on top of the router's own trigger policy.
-    const trigger = decision.trigger && event.triggerInference !== false;
+    // The admission decision (server veto, wake gate) composes with the
+    // router's own trigger policy.
+    const trigger = decision.trigger && admission.wake;
     messageMetadata.triggered = trigger;
 
     const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
@@ -9158,11 +9224,39 @@ export class AgentFramework {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
-    const origin = occ.event.event.origin;
+    const push = occ.event.event;
+    const origin = push.origin;
     // The wake carries the batch's channel so the turn freezes its reply
     // locus there (the materialized delivery at assembly wakes nobody).
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    // A deferred batch is admitted when it asks for its wake: the hold and
+    // the gate decide now; its materialized delivery at assembly is vetoed
+    // (`triggerInference: false`) and so is not shown to the gate again.
+    const decision = this.admitInbound({
+      lane: 'push',
+      serverId: occ.serverId,
+      channelId,
+      messageId: occ.eventId,
+      authorId,
+      tags: occ.tags,
+      addressed: isAddressedMessage(occ.tags, origin),
+      vetoed: false,
+      targetAgents: push.targetAgents,
+      gateContent: (push.content ?? [])
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n'),
+      gateMetadata: {
+        serverId: occ.serverId,
+        featureSet: push.featureSet,
+        eventId: occ.eventId,
+        eventType: 'mcpl:push-event',
+        ...(origin ?? {}),
+        ...(occ.tags ? { tags: occ.tags } : {}),
+      },
+    });
+    if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
         agentName,
@@ -9350,6 +9444,41 @@ export class AgentFramework {
       event.origin?.silent === true &&
       content.length === 0;
 
+    // Admission (Dendrite §D): the same decision as the channel lane. A DM
+    // arrives here, so this is where tuning out a DM takes effect (#232 gap
+    // 1). An event with no channel provenance cannot be held.
+    const decision = this.admitInbound({
+      lane: 'push',
+      serverId: event.serverId,
+      channelId: triggerChannel?.channelId,
+      messageId: event.eventId,
+      authorId: typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined,
+      tags: event.tags,
+      addressed: isAddressedMessage(event.tags, event.origin),
+      vetoed: event.triggerInference === false,
+      targetAgents: event.targetAgents,
+      gateContent: content
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n'),
+      gateMetadata: {
+        serverId: event.serverId,
+        featureSet: event.featureSet,
+        eventId: event.eventId,
+        eventType: 'mcpl:push-event',
+        ...(event.origin ?? {}),
+        ...(event.tags ? { tags: event.tags } : {}),
+      },
+    });
+    metadata.triggered = decision.wake;
+    if (decision.held && triggerChannel) {
+      metadata.tuneOut = { epochId: decision.held.epochId };
+      this.tuneOutCoordinator?.recordHeld(
+        event.serverId, triggerChannel.channelId, event.eventId, event.tags,
+        typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass,
+      );
+    }
+
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
       const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
@@ -9358,10 +9487,8 @@ export class AgentFramework {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
     }
 
-    if (event.triggerInference) {
-      // Default broadcast: the registry's untargeted recipients.
-      const targetAgents = event.targetAgents ?? this.registry.untargetedRecipients();
-      for (const agentName of targetAgents) {
+    if (decision.wake) {
+      for (const agentName of decision.recipients) {
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:push-event',
@@ -14259,10 +14386,11 @@ export class AgentFramework {
       this.mcplServerConfigs.set(config.id, config);
     }
 
-    // Find shouldTriggerInference callback:
-    // Per-server callback takes precedence; fall back to EventGate; fall back to no filter.
-    const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
-      ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
+    // The server-level veto on waking (a per-server shouldTriggerInference).
+    // The wake gate is deliberately NOT wired into the inbound lanes any
+    // more: it runs in the admission stage, after the hold decision, so a
+    // held message never forms a gate batch (#232 gap 3, root cause A).
+    const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference;
 
     // Push events handler (Step 6)
     this.initializePushCoalescer();
@@ -14310,6 +14438,12 @@ export class AgentFramework {
           }
         },
         shouldTriggerInference: triggerFilter,
+        latestInboundLocus: this.speechLocus === 'latest-inbound',
+        // A tool close of a tuned-out channel ends the epoch through the
+        // cancel flow, into the closed state (#232 gap 9).
+        onCloseTunedOut: (serverId, channelId) => {
+          this.tuneOutCoordinator?.cancel(serverId, channelId, 'channel-close', 'channel closed', undefined, undefined, 'closed');
+        },
         // Route a conversation fork's plain-text speech to its HOME channel, not
         // the process-global most-recent-inbound locus (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
@@ -16237,49 +16371,132 @@ export class AgentFramework {
    */
   /** tune_out tool (residents): enter or cancel a channel tune-out. */
   private dispatchTuneOutToolCall(agentName: string, call: ToolCall): void {
-    const coordinator = this.tuneOutCoordinator!;
-    const input = (call.input ?? {}) as {
-      channelId?: string; mode?: string;
-      cadenceSeconds?: number; backlogCap?: number; maxWakes?: number;
-      durationSeconds?: number;
-    };
-    const channelId = String(input.channelId ?? '');
-    const entry = this.channelRegistry?.listChannelsRaw()
-      .find((e) => e.descriptor.id === channelId);
-    let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
-    if (!entry) {
-      result = { success: false, error: `unknown channel: ${channelId}`, isError: false };
-    } else if (input.mode === 'cancel') {
-      const r = coordinator.cancel(entry.serverId, channelId, 'agent-tool', 'agent request');
-      result = r.ok
-        ? { success: true, data: { cancelled: channelId } }
-        : { success: false, error: r.error, isError: false };
-    } else {
-      const r = coordinator.enter(entry.serverId, channelId, {
-        cadenceSeconds: input.cadenceSeconds,
-        backlogCap: input.backlogCap,
-        maxWakes: input.maxWakes,
-        durationSeconds: input.durationSeconds,
-      }, 'agent-tool');
-      result = r.ok
-        ? {
-            success: true,
-            data: {
-              tunedOut: channelId,
-              cadenceSeconds: r.params.cadenceSeconds,
-              backlogCap: r.params.backlogCap,
-              maxWakes: r.params.maxWakes,
-            },
-          }
-        : { success: false, error: r.error, isError: false };
-    }
     this.queue.push({
       type: 'tool-result',
       callId: call.id,
       agentName,
       moduleName: 'tune-out',
-      result,
+      result: this.handleTuneOutTool(agentName, (call.input ?? {}) as Record<string, unknown>),
     });
+  }
+
+  /**
+   * The tune_out tool's body. Channel resolution is server-qualified: an id
+   * that exists on several servers needs `serverId` (#232 gap 8).
+   */
+  private handleTuneOutTool(
+    _agentName: string,
+    input: Record<string, unknown>,
+  ): { success: boolean; data?: unknown; error?: string; isError?: boolean } {
+    const coordinator = this.tuneOutCoordinator;
+    if (!coordinator || !this.channelRegistry) {
+      return { success: false, error: 'tune-out is not available (no MCPL channels)', isError: false };
+    }
+    const channelId = String(input.channelId ?? '');
+    const resolved = this.channelRegistry.resolveChannel(
+      channelId,
+      typeof input.serverId === 'string' && input.serverId ? input.serverId : undefined,
+    );
+    if ('error' in resolved) return { success: false, error: resolved.error, isError: false };
+    const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+    if (input.mode === 'cancel') {
+      const r = coordinator.cancel(resolved.serverId, resolved.channelId, 'agent-tool', 'agent request');
+      return r.ok
+        ? { success: true, data: { cancelled: resolved.channelId } }
+        : { success: false, error: r.error, isError: false };
+    }
+    const r = coordinator.enter(resolved.serverId, resolved.channelId, {
+      cadenceSeconds: num(input.cadenceSeconds),
+      backlogCap: num(input.backlogCap),
+      maxWakes: num(input.maxWakes),
+      durationSeconds: num(input.durationSeconds),
+    }, 'agent-tool');
+    if (!r.ok) return { success: false, error: r.error, isError: false };
+    return {
+      success: true,
+      data: {
+        tunedOut: resolved.channelId,
+        cadenceSeconds: r.params.cadenceSeconds,
+        backlogCap: r.params.backlogCap,
+        maxWakes: r.params.maxWakes,
+        ...(coordinator.hasReader()
+          ? {}
+          : { note: 'No subconscious is configured: this is a silent hold. Nothing summarizes or wakes you; the backlog is delivered when you cancel.' }),
+      },
+    };
+  }
+
+  /**
+   * The admission stage for one inbound event: the pure decision over the
+   * framework's policy inputs (recipients, the hold in force, the wake
+   * gate), traced. Callers apply it; nothing downstream re-asks.
+   */
+  private admitInbound(env: InboundEnvelope): AdmissionDecision {
+    const gateInfo = (e: InboundEnvelope) => ({
+      content: e.gateContent,
+      eventType: String(e.gateMetadata.eventType ?? 'unknown'),
+      serverId: String(e.gateMetadata.serverId ?? e.serverId),
+      channelId: typeof e.gateMetadata.channelId === 'string' ? e.gateMetadata.channelId : '',
+      metadata: e.gateMetadata,
+      tags: Array.isArray(e.gateMetadata.tags) ? (e.gateMetadata.tags as string[]) : undefined,
+    });
+    const decision = admit(env, {
+      untargetedRecipients: () => this.registry.untargetedRecipients(),
+      holdFor: (serverId, channelId) => {
+        const hold = this.tuneOutCoordinator?.holdFor(serverId, channelId) ?? null;
+        return hold ? { kind: 'tune-out', epochId: hold.epochId, serverId, channelId } : null;
+      },
+      ...(this.eventGate
+        ? {
+            gate: {
+              evaluate: (e: InboundEnvelope) => this.eventGate!.evaluate(gateInfo(e)).trigger,
+              // "Would the gate have woken them": a debounce policy says yes,
+              // later — for the hold's reader that is a pass, not a mute.
+              probe: (e: InboundEnvelope) => {
+                const d = this.eventGate!.probe(gateInfo(e));
+                return d.trigger || (typeof d.behavior === 'object' && d.behavior !== null && 'debounce' in d.behavior);
+              },
+            },
+          }
+        : {}),
+    });
+    this.emitTrace({
+      type: 'admission:decided',
+      lane: env.lane,
+      serverId: env.serverId,
+      channelId: env.channelId,
+      messageId: env.messageId,
+      recipients: decision.recipients,
+      held: decision.held ? decision.held.epochId : null,
+      wake: decision.wake,
+      gatePass: decision.gatePass,
+    });
+    return decision;
+  }
+
+  /**
+   * Make delivered messages durable now, including those the delivery left
+   * in the deferred queue: a tune-out release flips durable epoch state
+   * first, so its dump must not be lost to a crash in between (#232 gap 6).
+   */
+  private commitDeliveries(): void {
+    if (this.deferredMessages.length > 0) {
+      this.deferredWritesPersisted = true;
+      this.persistDeferredWrites();
+    }
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error('[tune-out] could not sync the store after a release:', err);
+    }
+  }
+
+  /** The history-reading tool the primary resident actually has, if any (#232 gap 11). */
+  private residentHistoryTool(): string | null {
+    const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
+    if (!primary) return null;
+    const names = this.getAllTools().map((t) => t.name).filter((n) => primary.canUseTool(n));
+    return names.find((n) => /(^|--)(fetch_history|channel_read|read_history|history)$/.test(n)) ?? null;
   }
 
   private dispatchSleepToolCall(agentName: string, call: ToolCall): void {

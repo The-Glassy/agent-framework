@@ -239,6 +239,43 @@ The fork has the resident's history as its own turns, the resident's refusal led
 
 Costs are those of [Cost](#cost): one Chronicle branch and one context manager per invocation, nothing copied. A fork over a 200k-message resident derives in under a millisecond and reads its first context in about ten.
 
+## Admission
+
+Every inbound channel event — a `channels/incoming` message or a `push/event` — passes one admission decision before anything acts on it (`src/admission/admit.ts`, called from both lanes in the framework). The decision answers the proposal's five questions once:
+
+| Question | Decided as |
+|---|---|
+| Is it captured? | Always. It is stored where it arrived, in the shared slot. |
+| Who may receive it? | The event's explicit targets, else the untargeted recipients. |
+| Body or hold? | A hold if a policy epoch (today: tune-out) is in force over the channel. A held message carries the record on itself, `metadata.tuneOut = { epochId }`, and is excluded from every resident's view by that record. |
+| May it wake them? | Not when held or vetoed by the server. Otherwise the wake gate decides, and it is consulted here, after the hold — so a held message never forms a debounce batch, never advances a counter. For a held message the gate is only *probed* (side-effect free), and that verdict is handed to the hold's reader as a precondition: a message the gate would have muted does not wake the reader either. |
+| Where may speech go? | A held message never counts as "the latest delivered inbound". Under the default `speech.locus: 'delivery'` nothing inbound sets a locus for a later turn at all (below). |
+
+Everything downstream reads the decision: the two lanes store and wake from it, the compiled view and the mid-turn injection use the same `heldFromResidents` predicate, the channel registry learns of a delivered message through `noteDelivered` instead of deciding at ingestion, and a tool close of a tuned-out channel ends the epoch through the cancel flow. The gate's batch delivery re-checks the hold, since an epoch can begin after an event was batched. The decision is traced as `admission:decided`.
+
+What it closes from issue #232 §2: gaps 1 (a DM can be tuned out: the push lane is admitted too), 2 (held traffic never moves the locus), 3 (no debounce wake for held mentions), 4 (a release names non-text blocks), 5 (no mid-turn injection of held messages), 6 (a release left in the deferred queue is durable and re-wakes the resident at boot), 7 (deferred held messages are in the release), 8 (server-qualified channel resolution; ambiguity is an error), 9 (`channel_close` releases), 10 (the hold machinery runs without a reader) and 11 (the truncation note names a history tool the resident has, or none). Each is a regression test in `test/admission-e2e.test.ts`, on the loopback MCPL server.
+
+### The speech locus
+
+`FrameworkConfig.speech.locus` chooses where a turn's plain prose goes when nothing names a destination.
+
+- `'delivery'` (the default) is the §3 carve-out the residents accepted in the architecture channel on 2026-10-06: the locus comes only from the delivery that woke the turn, a conversation fork's home channel, or a channel the agent opened during the turn. Incoming traffic never moves it — not between turns, and not mid-turn either: an addressed message injected during a turn is announced, and the reply is the agent's to address. A turn with no such locus keeps its prose private and is told so in a `[routing]` notice. `channel_publish` without a `channelId` is refused rather than defaulted.
+- `'latest-inbound'` restores the previous rule: the most recent delivered inbound message is a global fallback locus, and an addressed mid-turn injection re-pins the turn.
+
+Under both rules a held message is never "the latest inbound".
+
+### Tune-out without a reader
+
+The tune-out coordinator exists whenever MCPL channels do. With a reader (the persistent subconscious or reader forks) it summarizes on a cadence and wakes the reader on addressed traffic. Without one a tune-out is a *silent hold*: nothing summarizes, nothing wakes, suppressed mentions are still acknowledged, and the backlog is released on cancel; the tool result says so. A persisted epoch is therefore always resumed and released, whatever the configuration (gap 10). Residents are offered `tune_out` when a reader is configured or `tuneOut.enabled` is set.
+
+### What a release is
+
+A release is a system-framed notice with the count, the channel and the epoch, then the held messages up to `backlogCap` as `author: text [image] …` lines in block order, then the reader's report under the reader's own name. Messages still in the deferred queue (held while a turn was alive) are included. Above the cap the note names the history tool the resident actually has, or says the rest was not delivered. The release is made durable before the cancel returns.
+
+### Not here
+
+The per-recipient exposure model of nissa's household's proposal (an inbox outside recipient slots, `attention`/`inline` per channel per recipient, overlays), a `ChannelRef` value type, and the all-except scope are not built. Admission here decides per *slot*: residents share one message slot, so a hold applies to all of them, and a reader of the slot sees held traffic through its own view. The structure is the one those designs need — one decision, consumed downstream — so they are additions to the policy inputs, not another path.
+
 ## The rendering contract
 
 For a child with shared inheritance, reused solve and no overrides, the test `test/dendrite-derive.test.ts` compares **provider-formatted** requests (membrane's native formatter) up to the fork boundary, which is the end of the parent's last request:
@@ -336,8 +373,8 @@ The framework detects these at run time. The registry, lifecycle, attributed mai
 
 ## What is not implemented
 
-- **The admission stage.** The proposal asks for one path that decides, per recipient, whether an inbound event is captured, announced, delivered and allowed to wake, before any side effect. Only recipient selection is centralised here (`untargetedRecipients`, `gateRecipients`). The gate, the speech locus and the tune-out divert are unchanged, so the tune-out gaps listed in issue #232 remain.
-- **Tune-out and focus as policies over this machinery.** The tune-out coordinator still owns epochs, the divert and the wake budget; Dendrite supplies only the reader (below) and the result route.
+- **Per-recipient exposure.** Admission decides per shared slot, not per recipient (see [Admission](#admission)); the inbox, the `attention`/`inline` settings and overlays of nissa's household's proposal, and a `ChannelRef` value type, are not built.
+- **Focus as the all-except scope.** Tune-out is per channel; the all-except scope (#232 §3.2) is not built yet. The tune-out coordinator still owns epochs and the wake budget; Dendrite supplies the admission decision, the reader and the result route.
 - **Live-follow inheritance.** Shared inheritance takes a snapshot. The persistent reader (`reader: 'persistent'`, the default) keeps its live view of the shared slot; the fork reader does not need one, since each fork is derived at the head and handed what arrived since the last look.
 - **Conversation forks on shared inheritance.** They still copy. Moving them needs a decision about their existing stores.
 - **Retiring multi-residency.** Residents still share one message slot.
@@ -361,3 +398,6 @@ The proposal left these open. Each is a decision of this implementation and can 
 8. **A fork presents its turns under its parent's name**, so formatters that render participant names produce the same prefix as formatters that only assign roles.
 9. **Activations and policy epochs are derived from live state**, not recorded a second time.
 10. **A reader fork is handed the held traffic as framing, not as a view.** Delivering each held message to exactly one fork keeps the fork's request a pure extension of the resident's and leaves the coordinator as the only holder of the backlog; the alternative, a per-fork view filter over the shared slot, would have put tune-out state into the context manager. The reader's tools sit in the resident's tool block, refused at dispatch, for the same prefix.
+11. **The hold record lives on the message.** A held message is stamped at admission (`metadata.tuneOut`) and excluded from residents' views by that stamp; no second corpus and no separate delivery flag mirrors it (antra, architecture channel: recipient-state membership records delivery). Nothing is retro-inserted on release.
+12. **A debounce verdict counts as "would wake"** when the gate is probed for a held message, so a mention in a debounced, tuned-out channel still reaches the reader. The old order (gate before hold) returned false for it, which is what gap 3 observed.
+13. **`speech.locus` defaults to `'delivery'`**, the §3 carve-out, with `'latest-inbound'` to restore the previous rule — including the mid-turn addressed re-pin, which was ratified separately and is kept under that rule only.

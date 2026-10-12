@@ -467,8 +467,27 @@ interface ChannelRegistryOptions {
   ) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
-  /** Callback to determine whether an incoming message should trigger inference. */
+  /**
+   * The server-level veto on waking for an incoming message (a per-server
+   * `McplServerConfig.shouldTriggerInference`). The wake gate is NOT wired
+   * here: it runs in the framework's admission stage, after the hold
+   * decision, so a held message never forms a gate batch (issue #232 gap 3).
+   */
   shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  /**
+   * Whether the most recent delivered inbound message is a fallback speech
+   * locus for turns that have none of their own (`speech.locus:
+   * 'latest-inbound'`). Off by default: incoming traffic never moves the
+   * locus (architecture channel, 2026-10-06).
+   */
+  latestInboundLocus?: boolean;
+  /**
+   * A tuned-out channel is being closed by tool: end its epoch through the
+   * cancel flow (release the backlog, record the end) before the lifecycle
+   * state flips to closed. Without this hook the close would discard the
+   * epoch and strand its held messages (issue #232 gap 9).
+   */
+  onCloseTunedOut?: (serverId: string, channelId: string) => void;
   /**
    * Called when a text-only turn's speech could NOT be delivered to its
    * conversational locus — no locus, an unregistered channel, a missing
@@ -557,6 +576,8 @@ export class ChannelRegistry {
     op?: 'start' | 'stop',
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
+  private readonly latestInboundLocus: boolean;
+  private onCloseTunedOut?: (serverId: string, channelId: string) => void;
   private onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
@@ -679,6 +700,8 @@ export class ChannelRegistry {
     this.emitTraceFn = emitTraceFn;
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
+    this.latestInboundLocus = options?.latestInboundLocus === true;
+    this.onCloseTunedOut = options?.onCloseTunedOut;
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
@@ -928,25 +951,16 @@ export class ChannelRegistry {
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
-      // Track default publish channel (most recent ACCEPTED incoming) —
-      // deliberately after §14.5 validation: a rejected message from an
-      // unregistered channel must not retarget outbound speech (the locus is
-      // exactly the authority a self-attested channel would be stealing).
-      // A coalesced item is "accepted" only once the coalescer admits it, so
-      // for those this runs after the hook (below).
-      const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
-        // A server sending channels/incoming is authoritative evidence that
-        // the transport is actually open. This repairs transient status only;
-        // durable desired state still changes exclusively through lifecycle
-        // operations.
-        this.channels.get(incomingKey)!.open = true;
-      };
-      if (!coalesced) markAccepted();
+      // A server sending channels/incoming is authoritative evidence that
+      // the transport is actually open. This repairs transient status only;
+      // durable desired state still changes exclusively through lifecycle
+      // operations. Nothing else is decided here: whether this message is
+      // delivered, wakes anyone or counts as the latest inbound is the
+      // framework's admission decision, taken once the hold is known (see
+      // `noteDelivered`; issue #232 root cause A).
+      this.channels.get(incomingKey)!.open = true;
 
-      // Determine whether to trigger inference
+      // The server-level veto only; the wake gate runs at admission.
       let triggerInference = true;
       if (this.shouldTriggerInference) {
         const textContent = message.content
@@ -990,7 +1004,6 @@ export class ChannelRegistry {
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
           const result = await this.handleCoalescedIncoming!(serverId, message, event);
-          if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number };
@@ -1203,10 +1216,30 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * Get the default publish channel ID (most recent incoming channel).
+   * The most recent DELIVERED inbound message (channel, message, thread).
+   * Recorded by the framework after admission, so a held message never
+   * becomes "the latest inbound" (issue #232 gap 2). Read as the
+   * `incoming` reference in the channel context and, under
+   * `speech.locus: 'latest-inbound'`, as the fallback speech locus.
+   */
+  noteDelivered(channelId: string, messageId: string, threadId?: string): void {
+    this.defaultPublishChannel = channelId;
+    this.defaultPublishMessageId = messageId;
+    this.defaultPublishThreadId = threadId;
+  }
+
+  /**
+   * Get the default publish channel ID (most recent delivered incoming channel).
    */
   getDefaultPublishChannel(): string | null {
     return this.defaultPublishChannel;
+  }
+
+  /** Public form of the tool-input channel resolution: optional server, ambiguity is an error. */
+  resolveChannel(channelId: string, serverId?: string): { serverId: string; channelId: string } | { error: string } {
+    const resolved = this.resolveToolChannelEntry(channelId, serverId);
+    if (!resolved.entry) return { error: resolved.error ?? `Channel not found: ${channelId}` };
+    return { serverId: resolved.entry.serverId, channelId: resolved.entry.descriptor.id };
   }
 
   /**
@@ -1346,7 +1379,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? active ?? this.fallbackLocus();
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -2680,7 +2713,14 @@ export class ChannelRegistry {
       }
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+    // A tuned-out channel's epoch ends through the cancel flow — backlog
+    // released, end recorded — never by overwriting the state (#232 gap 9).
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out' && this.onCloseTunedOut) {
+      this.onCloseTunedOut(entry.serverId, input.channelId);
+    }
+    if (this.getDesiredState(entry.serverId, input.channelId) !== 'closed') {
+      this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+    }
     this.stopTyping(input.channelId);
 
     const server = this.serverRegistry.getServer(entry.serverId);
@@ -2937,7 +2977,17 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home ?? this.activeChannelResolver?.(conversationId) ?? this.fallbackLocus();
+  }
+
+  /**
+   * The locus a turn gets when neither a home channel nor its own delivery
+   * names one: the latest delivered inbound channel under the legacy rule,
+   * otherwise none — the prose stays private (architecture channel §3
+   * carve-out, 2026-10-06).
+   */
+  private fallbackLocus(): string | null {
+    return this.latestInboundLocus ? this.defaultPublishChannel : null;
   }
 
   async routeSpeech(
@@ -3076,8 +3126,9 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId: default to most recent incoming channel
-    const channelId = input.channelId ?? this.defaultPublishChannel;
+    // Resolve channelId. The latest delivered inbound channel is a default
+    // only under the legacy locus rule; otherwise a publish names its channel.
+    const channelId = input.channelId ?? this.fallbackLocus();
     if (!channelId) {
       return {
         success: false,
