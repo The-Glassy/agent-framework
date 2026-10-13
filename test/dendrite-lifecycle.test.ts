@@ -479,6 +479,31 @@ describe('Dendrite restart', () => {
     await until(() => gates.entered.has(name), `${name} to block`);
   }
 
+  it('a graceful stop leaves bounded work for the next boot to report as interrupted', async () => {
+    // First live run, finding D: a reader fork cut off by SIGTERM ended
+    // silently. stop() must not end work it cut off as if it had finished
+    // or failed; the next boot reports it, and a host whose trace sink
+    // attaches after create() (every host) still sees the trace.
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
+    await first.stop();
+    assert.equal(first.getAgentRecord('job')?.ended, undefined, 'stop does not end work it cut off');
+
+    const second = await process(new GateModule());
+    const traces: Array<{ type: string; agentName?: string; reason?: string }> = [];
+    second.onTrace((event) => traces.push(event as never));
+    assert.equal(second.getAgentRecord('job')?.ended?.reason, 'host-restart');
+    const notices = textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle');
+    assert.equal(notices.length, 1);
+    assert.match(notices[0]!.text, /the host restarted while "job" was still working for you/);
+    assert.ok(
+      traces.some((t) => t.type === 'dendrite:agent-ended' && t.agentName === 'job' && t.reason === 'host-restart'),
+      'the create()-time trace reaches a listener attached afterwards',
+    );
+  });
+
   it('tells a result recipient about bounded work a restart interrupted', async () => {
     const gates1 = new GateModule();
     const first = await process(gates1);

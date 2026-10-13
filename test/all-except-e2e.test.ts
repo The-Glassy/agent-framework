@@ -197,6 +197,29 @@ describe('tune-out, all-except scope', () => {
     } finally { await f.close(); }
   });
 
+  it('check/peek shows only what the active epoch holds, never a released one', async () => {
+    const f = await fixture({ framework: { subconscious: SUB } as Partial<FrameworkConfig> });
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy');
+      await incoming(f, 'noisy', 'n1', 'old held one');
+      await incoming(f, 'noisy', 'n2', 'old held two');
+      await settle(f);
+      assert.ok(internals(f).tuneOutCoordinator!.cancel('editor', 'noisy', 'agent-tool', 'test').ok);
+      f.alwaysRespond();
+      await f.framework.runUntilIdle();
+      enterAllExcept(f, 'work');
+      await incoming(f, 'noisy', 'n3', 'new held');
+      await f.framework.runUntilIdle();
+      const report = internals(f).tuneOutCoordinator!.check({ peek: { serverId: 'editor', channelId: 'noisy' } });
+      assert.deepEqual(report.allExcept!.held, { noisy: 1 });
+      assert.deepEqual(report.peek, ['antra: new held'], 'released traffic is not shown as held (first live run, finding B)');
+      assert.ok(internals(f).tuneOutCoordinator!.cancelAllExcept('agent-tool', 'test').ok);
+      await f.framework.runUntilIdle();
+      assert.deepEqual(internals(f).tuneOutCoordinator!.check({ peek: { serverId: 'editor', channelId: 'noisy' } }).peek, [], 'nothing active: nothing to peek');
+    } finally { await f.close(); }
+  });
+
   it('the room hears the door shut: entry and release are announced in the excepted channel; `tuneOut.announce: false` keeps quiet', async () => {
     const until = async (cond: () => boolean, what: string) => {
       for (let i = 0; i < 100 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));

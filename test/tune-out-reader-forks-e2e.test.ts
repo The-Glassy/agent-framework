@@ -223,6 +223,7 @@ describe('tune-out with reader forks', () => {
     assert.match(textOf(report), /nothing urgent/);
     assert.deepEqual((report.metadata!.dendrite as { from: unknown }).from, { agent: first.agentName, incarnation: 1 });
     assert.equal(scoutMessages().some((m) => textOf(m).includes('[Tune-out wake:')), false, 'notices never leak into the resident\'s window');
+    assert.equal(scoutMessages().some((m) => textOf(m) === 'reported'), false, 'a fork that reported through the tool does not report its trailing prose again');
 
     // The agent ended; the epoch did not.
     assert.equal(framework.listPolicyEpochs().length, 1);
@@ -241,6 +242,16 @@ describe('tune-out with reader forks', () => {
     await waitFor(() => framework.getAgentRecord(last.agentName)?.ended?.reason === 'completed', 'the cancel fork ends', 20_000);
     const lastFraming = (await framework.inspectAgentContext(last.agentName)).getAllMessages() as unknown as Msg[];
     assert.match(textOf(lastFraming.find((m) => m.metadata?.kind === 'tune-out-reader-framing')!), /\[Tune-out cancelled: disc:guild:noisy — wake budget exhausted/);
+
+    // A reader that answers in prose has still reported (first live run,
+    // finding A): the report is the fork's whole job, so its final prose
+    // reaches scout as its report, under its own name — not lost to
+    // proseRouting=disabled.
+    membrane.push('resident', createMockResponse([{ type: 'text', text: 'ack the prose report' }]));
+    await waitFor(() => scoutMessages().some((m) => m.participant === last.agentName && textOf(m).includes('final look')), 'the prose report reaches scout as mail');
+    const proseReport = scoutMessages().find((m) => m.participant === last.agentName && textOf(m).includes('final look'))!;
+    assert.equal(proseReport.metadata?.kind, 'agent-result');
+    assert.ok(traces.some((t) => t.type === 'tune-out:reader-prose-delivered' && (t as { agentName: string }).agentName === last.agentName), 'traced as a prose report');
     assert.equal(framework.listPolicyEpochs().length, 0);
     assert.deepEqual(
       framework.listAgents({ includeEnded: true }).filter((r) => r.kind === 'subconscious-fork').map((r) => r.ended?.reason),

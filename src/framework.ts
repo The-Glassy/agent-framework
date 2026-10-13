@@ -283,16 +283,14 @@ function extractChannelIdFromToolResult(
 }
 
 /**
- * True when an incoming channel message explicitly addressed the agent.
- * Primary signal is the MCPL RFC-001 `chat:addressed` tag (mention / reply /
- * DM, as classified by the server); the metadata booleans are the fallback
- * for servers that predate tags. Addressed messages outrank ambient chatter
+ * True when an incoming channel message explicitly addressed the agent: the
+ * MCPL RFC-001 `chat:addressed` tag (mention / reply / DM, as classified by
+ * the server). Tag-only — there is no metadata fallback, so a server that
+ * does not tag never addresses. Addressed messages outrank ambient chatter
  * when picking a turn's frozen speech locus.
  */
-const isAddressedMessage = (
-  tags?: string[],
-  _metadata?: Record<string, unknown>,
-): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
+const isAddressedMessage = (tags?: string[]): boolean =>
+  Array.isArray(tags) && tags.includes('chat:addressed');
 
 // parseProsePrefix moved to ./mcpl/prose-grammar.ts — ONE grammar shared with
 // the outgoing-stream router (Spec 14.3), so streamed chunks and delivered
@@ -1150,6 +1148,10 @@ export class AgentFramework {
   private quiesceReason?: string;
   private quiescedAt?: number;
   private traceListeners: TraceEventListener[] = [];
+  /** Traces emitted before start() — registry restore, interrupted work,
+   *  resumed epochs — replayed to listeners that attach afterwards, since a
+   *  host attaches its sinks after create() returns. Dropped at start(). */
+  private earlyTraces: TraceEvent[] | null = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private maintenanceIntervalMs: number;
@@ -1225,6 +1227,9 @@ export class AgentFramework {
    *  driveStream to clear sticky explicit-send suppression before handling
    *  the next model round. Never affects routing: the turn locus is frozen. */
   private midTurnInputSignals: Set<string> = new Set();
+  /** Channels whose addressed mid-turn traffic has already been announced
+   *  this turn (one notice per channel per turn). Turn-scoped. */
+  private turnAddressedElsewhere: Map<string, Set<string>> = new Map();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
@@ -2104,6 +2109,7 @@ export class AgentFramework {
 
     this.running = true;
     this.providerAdmissionClosed = false;
+    this.earlyTraces = null;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -2135,6 +2141,11 @@ export class AgentFramework {
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
+    // Bounded work this stop cuts off is neither finished nor failed. Its
+    // record stays live in the snapshot, so the next boot ends it as
+    // `host-restart` and tells its result recipient — the same as a crash
+    // (first live run, 2026-10-12, finding D: a reader fork ended silently).
+    for (const run of this.ephemeralRuns.values()) run.endReason ??= 'host-stop';
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
@@ -2556,6 +2567,9 @@ export class AgentFramework {
    */
   onTrace(listener: TraceEventListener): () => void {
     this.traceListeners.push(listener);
+    for (const event of this.earlyTraces ?? []) {
+      try { listener(event); } catch (error) { console.error('Trace listener error (replay):', error); }
+    }
     // Return an unsubscribe so callers with a bounded lifetime (e.g. modules
     // that get torn down and recreated on session switch) don't leak
     // listeners. Existing callers that ignore the return value are unaffected.
@@ -5534,9 +5548,21 @@ export class AgentFramework {
       this.activeTurnTokens.delete(agent.name);
       this.activeTurnTriggers.delete(agent.name);
       this.logicalTurnToolCalls.delete(agent);
-      // The identity ends with its run. Whatever it spawned is settled by
-      // the registry's rules (attention tenants end, task work is orphaned).
-      this.settleEndedAgent(this.registry.end(agent.name, run.endReason ?? 'failed', run.endedBy));
+      if (run.endReason === 'host-stop') {
+        // Cut off by stop(): left live for the next boot to end as interrupted.
+        const record = this.registry.inspect(agent.name);
+        this.emitTrace({
+          type: 'dendrite:agent-interrupted',
+          agentName: agent.name,
+          kind: record?.kind ?? candidate.spec.kind,
+          incarnation: record?.incarnation ?? 0,
+          reason: 'host-stop',
+        });
+      } else {
+        // The identity ends with its run. Whatever it spawned is settled by
+        // the registry's rules (attention tenants end, task work is orphaned).
+        this.settleEndedAgent(this.registry.end(agent.name, run.endReason ?? 'failed', run.endedBy));
+      }
     }
   }
 
@@ -7852,9 +7878,32 @@ export class AgentFramework {
           trigger: invocation.trigger,
           held: invocation.backlog.length,
         });
-        await this.runEphemeralToCompletion(fork.agent, fork.contextManager);
+        const outcome = await this.runEphemeralToCompletion(fork.agent, fork.contextManager);
+        // The report is the fork's whole job. A reader that ends in prose
+        // without `deliver_summary` has still reported — its final prose is
+        // delivered as its report, under its own name, instead of vanishing
+        // into proseRouting=disabled (first live run, 2026-10-12, finding A).
+        const prose = outcome.speech.trim();
+        if (prose && !this.tuneOutCoordinator?.readerReported(name)) {
+          this.deliverFromReader(name, [{ type: 'text', text: prose }], {
+            kind: 'subconscious-summary',
+            channelId: invocation.channelId,
+            epochId: invocation.epochId,
+            report: 'prose',
+          });
+          this.emitTrace({
+            type: 'tune-out:reader-prose-delivered',
+            agentName: name,
+            serverId: invocation.serverId,
+            channelId: invocation.channelId,
+            epochId: invocation.epochId,
+            chars: prose.length,
+          });
+        }
       } catch (error) {
         console.error(`[tune-out] reader fork ${name} failed:`, error instanceof Error ? error.message : error);
+      } finally {
+        this.tuneOutCoordinator?.forgetReader(name);
       }
     })();
   }
@@ -8098,6 +8147,49 @@ export class AgentFramework {
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
 
+          // Under `speech.locus: 'delivery'` incoming traffic never moves the
+          // pin — so when someone addresses the agent mid-turn from another
+          // channel, the agent must be told who and from where, or a neutral
+          // message reads as part of the conversation it landed in and gets
+          // answered there (first live run, 2026-10-12, finding C). One
+          // notice per channel per turn; it rides the same injection batch.
+          if (
+            this.speechLocus === 'delivery' &&
+            (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
+            !shouldEndTurn && !overBudget && currentState.stream
+          ) {
+            const pin = this.turnLocusPins.get(agent.name) ?? null;
+            for (const inj of [...midTurnInjections]) {
+              const m = inj.metadata as Record<string, unknown> | undefined;
+              if (!isConversationalInjection(inj.metadata)) continue;
+              if (typeof m?.channelId !== 'string' || m.channelId === pin) continue;
+              if (!isAddressedMessage(m.tags as string[] | undefined)) continue;
+              let noticed = this.turnAddressedElsewhere.get(agent.name);
+              if (noticed?.has(m.channelId)) continue;
+              if (!noticed) {
+                noticed = new Set();
+                this.turnAddressedElsewhere.set(agent.name, noticed);
+              }
+              noticed.add(m.channelId);
+              const who = (m.author as { name?: string } | undefined)?.name ?? 'Someone';
+              const where = pin ? `still lands in ${this.shownChannel(pin)}` : 'stays in your archive (no channel)';
+              const noticeContent: ContentBlock[] = [{
+                type: 'text',
+                text:
+                  `[routing] ${who} addressed you from ${this.shownChannel(m.channelId)} while you were busy. ` +
+                  `Your plain speech ${where} this turn; reaching them takes an explicit send.`,
+              }];
+              const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
+              try {
+                const id = agent.getContextManager().addMessage('user', noticeContent, noticeMeta);
+                this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+                midTurnInjections.push({ participant: 'user', content: noticeContent, metadata: noticeMeta });
+              } catch (err) {
+                console.error('mid-turn addressed-elsewhere notice failed:', err);
+              }
+            }
+          }
+
           // Addressed re-pin (2026-07-31 Mythos misroutes, antra-ratified):
           // when someone ADDRESSES the agent mid-turn from another channel
           // (mention / reply / DM — the same chat:addressed signal the
@@ -8151,7 +8243,7 @@ export class AgentFramework {
               if (!isConversationalInjection(inj.metadata)) return false;
               if (typeof m?.channelId !== 'string') return false;
               const tags = m.tags as string[] | undefined;
-              if (isAddressedMessage(tags, m)) return true;
+              if (isAddressedMessage(tags)) return true;
               return engaged?.has(m.channelId as string) === true;
             });
             const newLocus = (lastQualifying?.metadata as Record<string, unknown> | undefined)
@@ -8447,7 +8539,7 @@ export class AgentFramework {
     // anything downstream acts — the hold, the wake gate, who may be woken,
     // whether this counts as the latest delivered inbound. Every path below
     // consumes `decision`; none re-asks the policy.
-    const addressed = isAddressedMessage(event.tags, event.metadata);
+    const addressed = isAddressedMessage(event.tags);
     const decision = this.admitInbound({
       lane: 'channel',
       serverId: event.serverId,
@@ -8671,7 +8763,7 @@ export class AgentFramework {
         // triggering channel too so the trunk/active path stays consistent.
         channelId: event.channelId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
-        addressed: isAddressedMessage(event.tags, event.metadata),
+        addressed: isAddressedMessage(event.tags),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
@@ -9298,7 +9390,7 @@ export class AgentFramework {
       messageId: occ.eventId,
       authorId,
       tags: occ.tags,
-      addressed: isAddressedMessage(occ.tags, origin),
+      addressed: isAddressedMessage(occ.tags),
       vetoed: false,
       targetAgents: push.targetAgents,
       gateContent: (push.content ?? [])
@@ -9323,7 +9415,7 @@ export class AgentFramework {
         timestamp: Date.now(),
         channelId,
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
-        addressed: isAddressedMessage(occ.tags, origin),
+        addressed: isAddressedMessage(occ.tags),
         coalescingSubject: subject,
       });
     }
@@ -9512,7 +9604,7 @@ export class AgentFramework {
       messageId: event.eventId,
       authorId: typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined,
       tags: event.tags,
-      addressed: isAddressedMessage(event.tags, event.origin),
+      addressed: isAddressedMessage(event.tags),
       vetoed: event.triggerInference === false,
       targetAgents: event.targetAgents,
       gateContent: content
@@ -9556,7 +9648,7 @@ export class AgentFramework {
           // DMs and addressed-while-closed messages arrive as push events;
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
-          addressed: isAddressedMessage(event.tags, event.origin),
+          addressed: isAddressedMessage(event.tags),
           ...(silentHeartbeat ? {
             suppressProse: true,
             ephemeralSystemPrompt:
@@ -9874,6 +9966,31 @@ export class AgentFramework {
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
       });
     }
+  }
+
+  /**
+   * `channel_publish` with no channel goes where the turn's plain speech
+   * would: the frozen turn locus (the waking delivery's channel, or one
+   * opened this turn), then the registry's own resolution. Under
+   * `speech.locus: 'delivery'` the registry alone has no default, and the
+   * tool failed on the very turn its own delivery woke (first live run,
+   * 2026-10-12). Both dispatch paths — the stream driver's and
+   * executeToolCall's — pass through here.
+   */
+  private publishInputWithTurnLocus(input: unknown, agentName: string): unknown {
+    const given = (input as { channelId?: unknown } | null | undefined)?.channelId;
+    if (typeof given === 'string' && given !== '') return input;
+    const locus = this.turnLocusPins.get(agentName) ?? this.channelRegistry?.resolveLocus(agentName) ?? null;
+    if (!locus) return input;
+    return { ...((input as Record<string, unknown> | null | undefined) ?? {}), channelId: locus };
+  }
+
+  /** A channel as shown to the agent: its label with the id, or the id. */
+  private shownChannel(channelId: string): string {
+    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    return label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -10542,6 +10659,7 @@ export class AgentFramework {
       // prose deliveries — both are strictly turn-scoped (a restart continues
       // the same logical turn and keeps them).
       this.turnEngagedChannels.delete(agent.name);
+      this.turnAddressedElsewhere.delete(agent.name);
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
@@ -12477,7 +12595,10 @@ export class AgentFramework {
     // synthesized verbs (think, skip_reply) are deliberately not routed
     // here.
     if (call.name.startsWith('channel_') && this.channelRegistry) {
-      return this.channelRegistry.handleChannelToolCall(call.name, call.input, origin);
+      const input = call.name === 'channel_publish' && call.callerAgentName
+        ? this.publishInputWithTurnLocus(call.input, call.callerAgentName)
+        : call.input;
+      return this.channelRegistry.handleChannelToolCall(call.name, input, origin);
     }
 
     // The utils meta-tool — programmatic callers (code_execution scripts,
@@ -14016,6 +14137,10 @@ export class AgentFramework {
       timestamp: Date.now(),
     } as TraceEvent;
 
+    if (this.earlyTraces) {
+      this.earlyTraces.push(traceEvent);
+      if (this.earlyTraces.length > 1000) this.earlyTraces.shift();
+    }
     for (const listener of this.traceListeners) {
       try {
         listener(traceEvent);
@@ -16230,7 +16355,10 @@ export class AgentFramework {
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
+    const channelInput = call.name === 'channel_publish'
+      ? this.publishInputWithTurnLocus(call.input, agentName)
+      : call.input;
+    this.channelRegistry!.handleChannelToolCall(call.name, channelInput, { kind: 'agent', agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });

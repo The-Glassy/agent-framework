@@ -392,7 +392,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('under the default locus rule an addressed mid-turn injection is announced but does not move the pin', async () => {
+  it('under the default locus rule an addressed mid-turn injection is announced — who, from where — but does not move the pin', async () => {
     // `speech.locus: 'delivery'` (architecture channel §3 carve-out,
     // 2026-10-06): incoming traffic never moves the locus, mid-turn
     // included. The addressed message is still injected; the trailing
@@ -425,11 +425,17 @@ describe('present while acting', () => {
       { text: 'Station four, proceeding.', locus: 'chan-live-1' },
       { text: 'Still speaking into the scene.', locus: 'chan-live-1' },
     ], 'the pin did not move');
-    assert.equal(notices.length, 1, 'only the boot-baseline announcement — no re-pin notice');
+    assert.equal(notices.length, 2, 'the boot-baseline announcement and the addressed-from-elsewhere notice');
     const wired = membrane.lastStream!.receivedToolResultOptions
       .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
     assert.ok(wired.some((s) => s.includes('quick question')), 'the addressed message itself was injected');
     assert.ok(!wired.some((s) => s.includes('[routing] The conversation moved')), 'no re-pin notice');
+    // First live run, finding C: a neutral message carries nothing that names
+    // its channel, so the notice must — who, from where, and where the
+    // agent's prose still lands.
+    const notice = wired.find((s) => s.includes('[routing] Someone addressed you from discord:dm:antra'));
+    assert.ok(notice, 'the agent is told who addressed them and from where');
+    assert.ok(notice!.includes('still lands in chan-live-1'), 'and where its plain speech still goes');
 
     await framework.stop();
   });

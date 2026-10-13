@@ -733,10 +733,19 @@ export class TuneOutCoordinator {
     const result: TuneOutCheck = { allExcept, channels };
     if (opts.peek) {
       const limit = Math.max(1, Math.min(50, opts.peekLimit ?? 5));
+      // Only what is held NOW: the channel's own epoch, or the scope's. A
+      // released epoch's messages are delivered, not held; showing them here
+      // would be a false declaration (first live run, 2026-10-12, finding B).
+      const active = new Set<string>();
+      for (const e of channels) {
+        if (e.channelId === opts.peek.channelId && (!opts.peek.serverId || e.serverId === opts.peek.serverId)) active.add(e.epochId);
+      }
+      if (scope) active.add(scope.params.epochId);
       const lines = [...stored, ...deferred]
         .filter((m) => {
-          const meta = m.metadata as { tuneOut?: unknown; channelId?: string; serverId?: string } | undefined;
-          return !!meta?.tuneOut && meta.channelId === opts.peek!.channelId
+          const meta = m.metadata as { tuneOut?: { epochId?: string }; channelId?: string; serverId?: string } | undefined;
+          return typeof meta?.tuneOut?.epochId === 'string' && active.has(meta.tuneOut.epochId)
+            && meta.channelId === opts.peek!.channelId
             && (!opts.peek!.serverId || meta.serverId === opts.peek!.serverId);
         })
         .slice(-limit)
@@ -783,6 +792,17 @@ export class TuneOutCoordinator {
     if (gatePass && (addressed || privileged) && this.readerAvailable()) {
       this.scheduleWakeInvocation(serverId, channelId);
     }
+  }
+
+  /** Reader forks that reported through `deliver_summary` (so their trailing prose is not a second report). */
+  private readerReports = new Set<string>();
+
+  readerReported(reader: string): boolean {
+    return this.readerReports.has(reader);
+  }
+
+  forgetReader(reader: string): void {
+    this.readerReports.delete(reader);
   }
 
   private async acknowledgeSuppressed(serverId: string, channelId: string, messageId: string): Promise<void> {
@@ -1037,6 +1057,7 @@ export class TuneOutCoordinator {
         }
         if (caller && this.hooks.deliverFromReader) {
           // A reader fork's report: attributed mail under its own name.
+          this.readerReports.add(caller);
           this.hooks.deliverFromReader(caller, [{ type: 'text', text }], {
             kind: 'subconscious-summary',
             channelId,

@@ -487,6 +487,25 @@ export type TraceEvent =
       since?: number;
     })
 
+  /** A reader fork ended in prose without `deliver_summary`; its final prose was delivered as its report. */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-prose-delivered';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      chars: number;
+    })
+
+  /** Bounded work the host's stop() cut off: left live for the next boot to end as `host-restart`. */
+  | (TraceEventBase & {
+      type: 'dendrite:agent-interrupted';
+      agentName: string;
+      kind: string;
+      incarnation: number;
+      reason: 'host-stop';
+    })
+
   /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
   | (TraceEventBase & {
       type: 'tune-out:reader-fork';
