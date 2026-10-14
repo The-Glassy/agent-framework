@@ -11513,7 +11513,7 @@ export class AgentFramework {
     // never enters a resident's compiled view; only the subconscious reads
     // it through its merged view — no subconscious, nobody reads it.
     let readers: Agent[];
-    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
+    if (heldFromResidents(message.metadata as Record<string, unknown> | undefined)) {
       const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
       if (!subconscious) return true;
       readers = [subconscious];
@@ -12244,14 +12244,15 @@ export class AgentFramework {
   /**
    * Weigh a message that no tool boundary of the agent's open logical turn
    * will weigh: one that would re-pin the locus becomes one of the turn's
-   * arrivals (TurnRouting.arrivals). A message tune-out diverted
-   * (metadata.tuneOut) never enters a resident's compiled view, so the agent
-   * won't see it, and it moves nothing.
+   * arrivals (TurnRouting.arrivals). A message held from the residents
+   * (heldFromResidents, the admission stage's one predicate) never enters a
+   * resident's compiled view, so the agent won't see it, and it moves
+   * nothing.
    */
   private noteArrival(agentName: string, metadata: MessageMetadata | undefined, messageId: MessageId): void {
     const open = this.openLogical.get(agentName);
     if (!open) return;
-    if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    if (heldFromResidents(metadata as Record<string, unknown> | undefined)) return;
     const channelId = this.repinChannel(metadata, open);
     if (!channelId) return;
     const tags = (metadata as Record<string, unknown> | undefined)?.tags as string[] | undefined;
