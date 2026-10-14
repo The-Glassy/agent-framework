@@ -493,7 +493,7 @@ describe('Dendrite restart', () => {
 
     const second = await process(new GateModule());
     const traces: Array<{ type: string; agentName?: string; reason?: string }> = [];
-    second.onTrace((event) => traces.push(event as never));
+    second.onTrace((event) => traces.push(event as never), { replay: true });
     assert.equal(second.getAgentRecord('job')?.ended?.reason, 'host-restart');
     const notices = textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle');
     assert.equal(notices.length, 1);

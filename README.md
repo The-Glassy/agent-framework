@@ -224,6 +224,10 @@ it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
 Configure the online marker with `discordAwarenessEmoji`; the offline CLI
 accepts `--emoji`.
 
+For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
+
+`framework.getPlacedReactionBaseline()` returns a fresh snapshot of that default for other embeddings, including separately managed WebSocket adapters. It returns suppression tokens, with a custom emoji as its bare ID, not marker payloads for adding, removing or replaying a reaction. An unreadable awareness ledger throws instead of producing a partial snapshot. Hosts that previously supplied a refusal-only default must stop supplying it to adopt this framework-derived default; an explicit operator choice should remain intact.
+
 ### MCPL (MCP Live)
 
 Optional host-side implementation of the MCP Live protocol. External servers (game engines, dev tools, etc.) can:
@@ -243,6 +247,45 @@ Optional host-side implementation of the MCP Live protocol. External servers (ga
   }],
 }
 ```
+
+#### Tool names and tool-name patterns
+
+An MCPL tool reaches the model as `<toolPrefix>--<tool>`. `toolPrefix`
+defaults to `mcpl--<serverId>`: server `search` with no `toolPrefix` offers
+`mcpl--search--query`, and with `toolPrefix: 'search'` it offers
+`search--query`.
+
+These settings take RFC-007 §6.2 patterns (`*` matches any run of characters)
+over that full model-facing name, so they need the prefix:
+
+- `toolClassOverrides` (framework config), e.g. `{ 'mcpl--search--*': ['web'] }`
+- `toolLifecycle.observe.tools` and `toolLifecycle.inputs.tools` (per server)
+
+`enabledTools` / `disabledTools` (per server) are different: they take the
+bare server-side name (`query`) with no prefix.
+
+A pattern that matches no tool is reported once, as a console line and an
+`mcpl:tool-pattern-unmatched` trace. When the pattern used the bare server id
+(`search--*` under the default prefix), the report suggests the prefixed form.
+A pattern that could name a server's tools is not judged until that server
+has listed them, so late connects and reconnects don't cause early reports.
+
+#### Feature sets
+
+`enabledFeatureSets` and `disabledFeatureSets` select which of a server's
+declared feature sets are enabled (`.`-segment wildcards such as `chat.*`;
+`disabledFeatureSets` wins on overlap):
+
+- `enabledFeatureSets` omitted: every declared set is a candidate.
+- `enabledFeatureSets: []`: no set is enabled.
+- In both cases a set is enabled only if its declared `uses` lists
+  recognized capabilities that the server's grant covers. A set that declares
+  no `uses` stays disabled even when `enabledFeatureSets` lists it. This is
+  reported on the console and as an `mcpl:feature-set-disabled` trace.
+
+A server that refuses the host's policy is reported as an `mcpl:policy-refused`
+trace. With `fallback: 'close'` the host closes the connection; with
+`'mcp-only'` only plain MCP tools keep working.
 
 #### Event coalescing (RFC-006)
 
@@ -267,6 +310,10 @@ host appends, as it does today. There is no per-subject cap: a busy channel's
 unread backlog is simply its unread backlog. Receipts and subject history are
 kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
 `mcpl:coalescing` trace events.
+
+#### Per-channel conversation routing (deprecated)
+
+> **Deprecated: `FrameworkConfig.conversations` (`ConversationRouter`).** Per-channel conversation routing sends each channel's traffic to its own fork agent, spawned from a template agent and closed after an idle TTL. It is being retired ([#235](https://github.com/anima-research/agent-framework/issues/235)). Its `'mention'` bind/trigger rule, the default for channels, reads `metadata.mentioned`, which discord-mcpl does not set, so on Discord channels an @-mention never binds a fork or triggers a bound one. Don't adopt it in new hosts. Existing configurations still route exactly as before, and the framework logs one `[deprecated]` line when it is created with `conversations` set. Removal is a follow-up.
 
 ### Streaming Lifecycle
 
@@ -295,7 +342,7 @@ const server = new ApiServer(framework, { port: 8765 });
 await server.start();
 ```
 
-**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`
+**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`, `host.providerWaits/releaseProviderWait`
 
 Also available as an MCP server via the `agent-framework-mcp` binary.
 
@@ -316,9 +363,12 @@ await framework.resume();            // throws ResumeBlockedError if the layout 
 Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
 `POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
 `host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
-servers granted `allowHostCommands`. The HTTP host verbs accept an optional
-shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
-deployments that front the port with a proxy.
+servers granted `allowHostCommands`. The same servers can lift a provider's
+stated wait with `release-provider-wait` (`agentName`, optional `model`), as
+`host.releaseProviderWait` does over the WebSocket API, and
+`host.providerWaits` lists the waits that bind. The HTTP host verbs accept an
+optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
+for deployments that front the port with a proxy.
 
 ## Observability
 

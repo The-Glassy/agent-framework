@@ -7,7 +7,7 @@
   shows only the epochs holding the channel now, never a released one;
   `stop()` leaves bounded work it cuts off live for the next boot to end as
   `host-restart` and report (`dendrite:agent-interrupted` at stop), and
-  create()-time traces replay to listeners attached afterwards;
+  create()-time traces replay to a listener that asks (`onTrace(fn, { replay: true })`);
   `channel_publish` without a `channelId` goes to the turn's locus (the
   waking delivery, a channel opened this turn) before being refused.
   `isAddressedMessage` is tag-only and says so; its unread parameter is gone.

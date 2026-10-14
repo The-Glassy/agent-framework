@@ -107,6 +107,8 @@ export {
 
 // Server connection and registry
 export { McplServerConnection } from './server-connection.js';
+export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { TransportCloseInfo } from './transport.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)
@@ -158,7 +160,9 @@ export { InferenceRouter } from './inference-router.js';
 export { ChannelRegistry } from './channel-registry.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,

@@ -8,6 +8,7 @@ export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
+export { ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './shutdown.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 
@@ -94,7 +95,7 @@ export type { McplServerConfig } from './mcpl/index.js';
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
 export { McplServerConnection } from './mcpl/index.js';
-export type { McplHostCapabilities } from './mcpl/index.js';
+export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
 // needs to write McplServerConfig.toolLifecycle policy and class tables, and
@@ -110,7 +111,9 @@ export type {
 } from './mcpl/index.js';
 
 // Per-channel conversation routing
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
@@ -143,7 +146,12 @@ export type {
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
 export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
-export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
+export type {
+  OperatorLogEntry,
+  OperatorLogInput,
+  OperatorRequester,
+  SurgeryMarkerReceipt,
+} from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,
@@ -160,3 +168,9 @@ export {
   type ForkReaderConfig,
   type ReaderFramingContext,
 } from './tune-out/tools.js';
+export {
+  SILENT_HEARTBEAT_SEPARATOR,
+  silentHeartbeatOf,
+  type SilentHeartbeatStamp,
+  type SilentHeartbeatTick,
+} from './silent-heartbeat.js';

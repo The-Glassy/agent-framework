@@ -1,6 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
+import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -52,11 +53,14 @@ export interface AgentConfig {
   /**
    * The model's PHYSICAL context window (provider hard cap, e.g. 200000).
    * When set, the framework projects each continuation round's real size
-   * (cache-inclusive input of the prior round + the blocks about to be
-   * appended + reserve for response) and restarts the stream through a fresh
-   * compile instead of dispatching a request the provider will 400
-   * (issue #92: a legal compile can walk past the physical window mid-turn).
-   * Unset → no projection; only the maxStreamTokens restart applies.
+   * (cache-inclusive input of the latest call that reported its prompt +
+   * that call's output + what the stream has grown by since, if later calls
+   * reported none + the blocks about to be appended + reserve for response)
+   * and restarts the stream through a fresh compile instead of dispatching a
+   * request the provider will 400 (issue #92: a legal compile can walk past
+   * the physical window mid-turn). The projection runs once a call on the
+   * stream has reported its prompt. Unset → no projection; only the
+   * maxStreamTokens restart applies.
    */
   physicalWindowTokens?: number;
 
@@ -250,7 +254,20 @@ export interface AgentRuntimeSettingsPatch {
 }
 
 export interface AgentRuntimeSettingsSnapshot {
+  /**
+   * The budget the agent is set to: while a lower one converges, its target,
+   * and while a persisted one the agent couldn't apply is kept, that one.
+   */
   contextBudgetTokens: number;
+  /**
+   * The budget compiles plan at now: the live budget, or the default when the
+   * recipe sets none (the context manager's own default is the same). It
+   * equals `contextBudgetTokens` except while a lower budget converges, when
+   * it is still the budget the descent started from (context-manager #162),
+   * and while a budget the agent couldn't apply is kept, when it is the
+   * budget the agent runs at instead.
+   */
+  effectiveContextBudgetTokens: number;
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
@@ -260,7 +277,27 @@ export interface AgentRuntimeSettingsSnapshot {
 }
 
 /** Persisted values differ from recipe defaults; omitted keys inherit config. */
-export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch;
+export type AgentRuntimeSettingsOverrides = AgentRuntimeSettingsPatch & {
+  /**
+   * The record's own `contextBudgetTokens`, written when a compile at the
+   * agent's live budget fits at it, with nothing about the budget changed
+   * while it ran (a paced descent's settle included): the store fit that
+   * budget. A compile the context manager refuses at it as over budget
+   * withdraws it, unless a compile at it that started later has already
+   * ended.
+   * When it equals `contextBudgetTokens`, a restore applies that budget at
+   * once, rather than pacing a descent again from the recipe's budget
+   * (context-manager #162), if a preview at boot says it still fits; if not,
+   * a budget below the recipe's restores paced, and if a compile at one that
+   * the boot applied at once is refused, the agent restores it paced then.
+   * Since the store fit it when the field was written, the planner can fold
+   * to it at once even if its carried frontier was lost. Any other value is
+   * stale (the budget changed since, or an earlier release carried the field
+   * forward), and a budget below the recipe's restores paced, as it does
+   * without the field. Never part of a patch.
+   */
+  contextBudgetReachedTokens?: number;
+};
 
 /**
  * Result of running inference.
@@ -334,6 +371,14 @@ export interface InferenceRequest {
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;
+  /** Host-owned: this wake's cause is an RFC-006 deferred batch, which has
+   *  no model-visible content until it renders at the turn's assembly. */
+  coalescingBatch?: boolean;
+  /** Host-owned, set on a turn's trigger when EVERY request batched into it
+   *  was a deferred-batch wake: these are their subjects. If assembly settles
+   *  all of them without materializing content, the turn has no cause left
+   *  and does not run. */
+  coalescingBatchSubjects?: string[];
   agentName: string;
   reason: string;
   source: string;
@@ -368,8 +413,10 @@ export interface InferenceRequest {
    * Where the wake came from, for telemetry ONLY — never a speech locus.
    * Set by the EventGate for batched wakes (composite channel id of the
    * chosen event when the event carried one; push-event raw ids are not
-   * used). Routing keeps reading `channelId`, which only the direct channel
-   * paths set from normalized ids — a gate wake leaves it unset, as before.
+   * used). Routing keeps reading `channelId`, set from registered ids: by
+   * the direct channel paths, and by a gate wake only when its chosen event
+   * addressed the agent and the host resolved that event's registered
+   * channel (ambient-only batches leave it unset).
    */
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
@@ -380,4 +427,8 @@ export interface InferenceRequest {
   /** Ephemeral system-position prompt for this turn only. Never written to
    * Chronicle; callers must supply bounded non-secret control text. */
   ephemeralSystemPrompt?: string;
+  /** The authenticated silent heartbeat tick this turn answers. Every row the
+   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
+   * builds render a request-only separator before the tick's first row. */
+  silentHeartbeat?: SilentHeartbeatTick;
 }
