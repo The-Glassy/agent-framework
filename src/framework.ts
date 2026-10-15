@@ -6742,7 +6742,13 @@ export class AgentFramework {
 
   /**
    * The creation ("consent") event: names what kind of agent this is, what
-   * ends it and what happens to it when its spawner ends.
+   * ends it and what happens to it when its spawner ends. A derived agent's
+   * creation is also told to the agent it was derived from (#270, Linn:
+   * "told when the body changes" as a property, not a courtesy): one
+   * host-framed line in the source's context, built from the same facts as
+   * the trace, no wake, no switch. Both derivation paths announce after the
+   * fork's branch or copy exists, so a fork never inherits the notice about
+   * itself; a source that has ended is told nothing (lifecycleNotice).
    */
   private announceAgentCreated(record: AgentRecord): void {
     this.emitTrace({
@@ -6758,6 +6764,60 @@ export class AgentFramework {
       ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
       ...(record.inherit ? { inherit: record.inherit } : {}),
     });
+    const from = record.inherit?.from;
+    if (from && from !== record.name) {
+      this.lifecycleNotice(from, this.derivationNotice(record, from), {
+        event: 'derived',
+        agent: record.name,
+        kind: record.kind,
+        incarnation: record.incarnation,
+        ...(record.model ? { model: record.model } : {}),
+        inherit: record.inherit,
+        ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
+        lifetime: record.lifetime,
+      });
+    }
+  }
+
+  /** The derivation notice's text, addressed to the agent `from` the record was derived. */
+  private derivationNotice(record: AgentRecord, from: string): string {
+    const sourceModel = this.agentConfigs.get(from)?.model ?? this.registry.get(from)?.model;
+    const weights = !record.model
+      ? ''
+      : record.model === sourceModel
+        ? ` on your weights (${record.model})`
+        : ` on ${record.model}`;
+    const inherited = record.inherit?.mode === 'shared'
+      ? 'reading your context up to this point'
+      : 'with a copy of your context';
+    const route = record.relationships.resultTo;
+    const result = !route
+      ? record.homeChannel
+        ? `it speaks for itself in ${record.homeChannel}`
+        : 'it returns nothing to you'
+      : route.to === from
+        ? `its result returns to you as ${route.as === 'message' ? 'a message' : 'a tool result'}`
+        : `its result goes to ${route.to}`;
+    const lifetime = record.lifetime;
+    const minutes = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1_000)} s` : `${Math.round(ms / 60_000)} min`);
+    const ends = lifetime.kind === 'task'
+      ? 'it ends when its task does' +
+        (lifetime.deadlineMs !== undefined || lifetime.idleTimeoutMs !== undefined
+          ? ` (${[
+              lifetime.deadlineMs !== undefined ? `deadline ${minutes(lifetime.deadlineMs)}` : '',
+              lifetime.idleTimeoutMs !== undefined ? `idle ${minutes(lifetime.idleTimeoutMs)}` : '',
+            ].filter(Boolean).join(', ')})`
+          : '')
+      : lifetime.kind === 'idle'
+        ? `it ends after ${minutes(lifetime.idleTtlMs)} idle`
+        : 'it persists';
+    const parentEnd = record.relationships.spawnedBy === from
+      ? record.onParentEnd === 'end' ? ', and ends with you' : ', and is orphaned if you end'
+      : '';
+    const made = record.incarnation > 1
+      ? `was resumed (incarnation ${record.incarnation}) as`
+      : 'was derived from you as';
+    return `[Agent lifecycle: ${record.name} ${made} a ${record.kind}${weights}, ${inherited}; ${result}; ${ends}${parentEnd}.]`;
   }
 
   /**

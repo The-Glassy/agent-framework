@@ -286,6 +286,44 @@ describe('Dendrite lifecycle', () => {
     assert.equal(membrane.callsFor('mira').length, 0, 'the primary is not woken for a result routed elsewhere');
   });
 
+  it('a derivation tells the agent it was made from — name, kind, weights, inheritance, route, lifetime — and not the fork (#270)', async () => {
+    const framework = await boot();
+    framework.start();
+    const fork = await startBlocked(
+      framework,
+      'fork-1',
+      'g1',
+      taskForkSpec('fork-1', { parent: 'oren', resultTo: { to: 'oren', as: 'message' }, idleTimeoutMs: 600_000 }),
+    );
+    const told = () => textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-lifecycle');
+    assert.equal(told().length, 1, 'the source hears of the derivation once, as a host-framed lifecycle line');
+    const line = told()[0]!;
+    assert.equal(line.participant, 'user', 'host-framed, voiced as nobody');
+    for (const fact of ['fork-1', 'task-fork', 'your weights', 'copy of your context', 'returns to you', 'orphaned']) {
+      assert.ok(line.text.includes(fact), `the notice names ${JSON.stringify(fact)}: ${line.text}`);
+    }
+    assert.deepEqual(
+      { ...(line.metadata.dendrite as Record<string, unknown>), lifetime: undefined, inherit: undefined },
+      { event: 'derived', agent: 'fork-1', kind: 'task-fork', incarnation: 1, model: 'test-model', resultTo: { to: 'oren', as: 'message' }, lifetime: undefined, inherit: undefined },
+    );
+    assert.ok(
+      !fork.contextManager.getAllMessages().some((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-lifecycle'),
+      'the fork never inherits the notice about itself',
+    );
+    assert.equal(membrane.callsFor('oren').length, 0, 'a notice requests no wake');
+
+    gates.release('g1');
+    const result = await fork.settled;
+    assert.ok(result.ok);
+
+    // A resumption is announced to the source too, and says which it is.
+    membrane.script('fork-1', say('back again'));
+    const resumed = await framework.resumeAgent('fork-1', { model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+    await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.equal(told().length, 2);
+    assert.ok(told()[1]!.text.includes('resumed') && told()[1]!.text.includes('incarnation 2'), told()[1]!.text);
+  });
+
   it('orphans task work when its parent ends, offers adoption, and holds the result until adopted', async () => {
     const framework = await boot();
     const traces: TraceEvent[] = [];
