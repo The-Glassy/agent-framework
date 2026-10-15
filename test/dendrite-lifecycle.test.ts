@@ -324,6 +324,36 @@ describe('Dendrite lifecycle', () => {
     assert.ok(told()[1]!.text.includes('resumed') && told()[1]!.text.includes('incarnation 2'), told()[1]!.text);
   });
 
+  it('above a threshold, derivation notices collapse to a count line every threshold forks (Linn, #270)', async () => {
+    const framework = await boot({ dendrite: { collapseDerivationNoticesAfter: 3 } });
+    framework.start();
+    for (let n = 1; n <= 7; n++) {
+      const name = `reader-${n}`;
+      membrane.script(name, say('looked'));
+      const { agent, contextManager } = await framework.createEphemeralAgent(
+        { name, model: 'test-model', systemPrompt: 'Read.' },
+        taskForkSpec(name, { parent: 'oren', resultTo: { to: 'oren', as: 'message' } }),
+      );
+      contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      await framework.runEphemeralToCompletion(agent, contextManager);
+    }
+    const told = textsIn(framework, 'oren').filter((m) => m.metadata.kind === 'agent-lifecycle');
+    assert.deepEqual(
+      told.map((m) => (m.metadata.dendrite as { agent: string }).agent),
+      ['reader-1', 'reader-2', 'reader-3', 'reader-6'],
+      'three per-fork lines, then one count line at the sixth; the seventh waits for the ninth',
+    );
+    const count = told[3]!;
+    assert.ok(count.text.includes('6 task-forks have been derived from you'), count.text);
+    assert.ok(count.text.includes('3 since the last note'), count.text);
+    assert.ok(count.text.includes('the latest, reader-6,'), count.text);
+    assert.deepEqual((count.metadata.dendrite as { collapsed: unknown }).collapsed, { count: 6, sinceLastNote: 3 });
+    assert.equal(
+      framework.listAgents({ includeEnded: true }).filter((r) => r.kind === 'task-fork').length, 7,
+      'the per-fork records are all there for anyone who fetches',
+    );
+  });
+
   it('orphans task work when its parent ends, offers adoption, and holds the result until adopted', async () => {
     const framework = await boot();
     const traces: TraceEvent[] = [];

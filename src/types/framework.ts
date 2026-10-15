@@ -105,6 +105,15 @@ export interface FrameworkConfig {
      * decisions itself from the `dendrite:agent-orphaned` trace.
      */
     announceOrphans?: boolean;
+    /**
+     * Every derivation tells the agent it was made from, in one host-framed
+     * line. After this many derivations of one kind from one agent, that
+     * agent hears a count line every so many instead of a line per fork, so
+     * a reader loop that forks a hundred times a session doesn't fill its
+     * source's context with stamps; the registry and traces keep every
+     * record. Default 10; 0 never collapses.
+     */
+    collapseDerivationNoticesAfter?: number;
   };
 
   /**

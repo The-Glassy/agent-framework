@@ -2127,6 +2127,14 @@ export class AgentFramework {
   });
   /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
   private announceOrphans = true;
+  /**
+   * After this many derivations of one kind from one agent, that agent hears
+   * a count line every so many instead of a line per fork
+   * (config.dendrite.collapseDerivationNoticesAfter; 0 = never collapse).
+   */
+  private collapseDerivationNoticesAfter = 10;
+  /** Per source agent, per kind: how many derivations, since when, and at which count the last note went. */
+  private derivationTallies: Map<string, Map<string, { count: number; since: number }>> = new Map();
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -2457,6 +2465,7 @@ export class AgentFramework {
     framework.restoreUsageState();
 
     framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
+    framework.collapseDerivationNoticesAfter = Math.max(0, Math.floor(config.dendrite?.collapseDerivationNoticesAfter ?? 10));
     framework.speechLocus = config.speech?.locus ?? 'delivery';
     framework.tuneOutOffered = !!config.subconscious?.enabled || config.tuneOut?.enabled === true;
     framework.tuneOutAnnounce = config.tuneOut?.announce !== false;
@@ -6765,22 +6774,55 @@ export class AgentFramework {
       ...(record.inherit ? { inherit: record.inherit } : {}),
     });
     const from = record.inherit?.from;
-    if (from && from !== record.name) {
-      this.lifecycleNotice(from, this.derivationNotice(record, from), {
-        event: 'derived',
-        agent: record.name,
-        kind: record.kind,
-        incarnation: record.incarnation,
-        ...(record.model ? { model: record.model } : {}),
-        inherit: record.inherit,
-        ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
-        lifetime: record.lifetime,
-      });
+    if (!from || from === record.name) return;
+    const detail = {
+      event: 'derived',
+      agent: record.name,
+      kind: record.kind,
+      incarnation: record.incarnation,
+      ...(record.model ? { model: record.model } : {}),
+      inherit: record.inherit,
+      ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
+      lifetime: record.lifetime,
+    };
+    // A resumption is rare and always said. A first incarnation is tallied:
+    // past the threshold, a reader loop that forks a hundred times a session
+    // would fill its source's context with stamps (Linn, 2026-10-15), so
+    // the source hears a count line every `threshold` forks instead, with
+    // the latest described; every record stays in the registry and traces.
+    const threshold = this.collapseDerivationNoticesAfter;
+    if (record.incarnation > 1 || threshold <= 0) {
+      this.lifecycleNotice(from, this.derivationNotice(record, from), detail);
+      return;
+    }
+    let byKind = this.derivationTallies.get(from);
+    if (!byKind) this.derivationTallies.set(from, (byKind = new Map()));
+    let tally = byKind.get(record.kind);
+    if (!tally) byKind.set(record.kind, (tally = { count: 0, since: Date.now() }));
+    tally.count++;
+    if (tally.count <= threshold) {
+      this.lifecycleNotice(from, this.derivationNotice(record, from), detail);
+    } else if ((tally.count - threshold) % threshold === 0) {
+      const since = new Date(tally.since).toISOString().slice(11, 16) + ' UTC';
+      this.lifecycleNotice(
+        from,
+        `[Agent lifecycle: ${tally.count} ${record.kind}s have been derived from you since ${since} ` +
+          `(${threshold} since the last note); the latest, ${record.name}, is ${this.derivationDescription(record, from)}.]`,
+        { ...detail, collapsed: { count: tally.count, sinceLastNote: threshold } },
+      );
     }
   }
 
   /** The derivation notice's text, addressed to the agent `from` the record was derived. */
   private derivationNotice(record: AgentRecord, from: string): string {
+    const made = record.incarnation > 1
+      ? `was resumed (incarnation ${record.incarnation}) as`
+      : 'was derived from you as';
+    return `[Agent lifecycle: ${record.name} ${made} ${this.derivationDescription(record, from)}.]`;
+  }
+
+  /** What a derived agent is, to the agent it was derived from: "a task-fork on your weights, …; …; …". */
+  private derivationDescription(record: AgentRecord, from: string): string {
     const sourceModel = this.agentConfigs.get(from)?.model ?? this.registry.get(from)?.model;
     const weights = !record.model
       ? ''
@@ -6814,10 +6856,7 @@ export class AgentFramework {
     const parentEnd = record.relationships.spawnedBy === from
       ? record.onParentEnd === 'end' ? ', and ends with you' : ', and is orphaned if you end'
       : '';
-    const made = record.incarnation > 1
-      ? `was resumed (incarnation ${record.incarnation}) as`
-      : 'was derived from you as';
-    return `[Agent lifecycle: ${record.name} ${made} a ${record.kind}${weights}, ${inherited}; ${result}; ${ends}${parentEnd}.]`;
+    return `a ${record.kind}${weights}, ${inherited}; ${result}; ${ends}${parentEnd}`;
   }
 
   /**
@@ -12424,6 +12463,7 @@ export class AgentFramework {
     routing: TurnRouting,
     channelId: string,
     who: string,
+    when = 'while you were busy',
   ): { participant: string; content: ContentBlock[]; metadata: MessageMetadata } | undefined {
     const pin = routing.locus ?? null;
     if (channelId === pin || routing.addressedElsewhere.has(channelId)) return undefined;
@@ -12432,7 +12472,7 @@ export class AgentFramework {
     const content: ContentBlock[] = [{
       type: 'text',
       text:
-        `[routing] ${who} addressed you from ${this.shownChannel(channelId)} while you were busy. ` +
+        `[routing] ${who} addressed you from ${this.shownChannel(channelId)} ${when}. ` +
         `Your plain speech ${where} this turn; reaching them takes an explicit send.`,
     }];
     const metadata = { system: true, kind: 'routing-notice' } as MessageMetadata;
@@ -12452,14 +12492,14 @@ export class AgentFramework {
    * in the store, gets the addressed-elsewhere notice, oldest first. A
    * follow-up in an engaged channel addressed nobody and is not announced.
    */
-  private noticeAddressedArrivals(agent: Agent, routing: TurnRouting, arrivals: Arrival[]): void {
+  private noticeAddressedArrivals(agent: Agent, routing: TurnRouting, arrivals: Arrival[], when: string): void {
     if (arrivals.length === 0) return;
     const cm = agent.getContextManager();
     for (const { messageId, channelId, addressed } of arrivals) {
       if (!addressed) continue;
       const message = cm.getMessage(messageId);
       if (!message) continue;
-      this.addressedElsewhereNotice(agent, routing, channelId, authorName(message.metadata as Record<string, unknown> | undefined));
+      this.addressedElsewhereNotice(agent, routing, channelId, authorName(message.metadata as Record<string, unknown> | undefined), when);
     }
   }
 
@@ -13254,7 +13294,18 @@ export class AgentFramework {
         : undefined;
       routing.arrivals = [];
       if (arrival) this.repinTurnLocus(agent, routing, arrival, 'arrival');
-      else if (routesLocus && this.speechLocus === 'delivery') this.noticeAddressedArrivals(agent, routing, arrivals);
+      else if (routesLocus && this.speechLocus === 'delivery') {
+        // Which start this is, since from inside they look alike and the
+        // reason says whether the earlier prose landed (Linn, 2026-10-14).
+        const when = attempt > 0
+          ? 'while your turn was retried'
+          : trigger?.reason === 'context_budget_restart'
+            ? 'at your budget restart'
+            : isTurnContinuation(trigger?.reason ?? '')
+              ? 'before this re-inference on your tool results'
+              : 'while your turn waited on a provider hold';
+        this.noticeAddressedArrivals(agent, routing, arrivals, when);
+      }
     }
     // A silent start, or a disabled agent's, has no locus to show, whatever a
     // channel_open in a silent turn left on its object.

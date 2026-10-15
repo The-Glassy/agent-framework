@@ -4,7 +4,9 @@
   landed between the turn's streams) moves the locus as 0.22.1 does; under
   `'delivery'` (the default) neither moves it, and an arrival that addressed
   the agent from another channel is announced at the turn's next start with
-  the same `[routing] … addressed you from …` notice a tool boundary gives.
+  the same `[routing] … addressed you from …` notice a tool boundary gives,
+  naming which start it is: a provider hold, a re-inference on tool
+  results, a budget restart or a retry.
   The per-agent routing maps the Dendrite seam read (`turnLocusPins`,
   `turnEngagedChannels`) are gone with the rework; the seam reads the turn's
   `TurnRouting`. `conversationAgentHomes` and `sharedSlotAgents` are answered

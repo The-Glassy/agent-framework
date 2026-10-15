@@ -798,6 +798,40 @@ describe('present while acting', () => {
     const notice = notices.find((t) => t.includes('addressed you from discord:dm:antra'));
     assert.ok(notice, 'the deferred compile is told who addressed the agent, and from where');
     assert.ok(notice!.includes('still lands in chan-live-1'), 'and where its plain speech still lands');
+    assert.ok(notice!.includes('while your turn waited on a provider hold'), `which boundary it reports: ${notice}`);
+
+    await framework.stop();
+  });
+
+  it('under the default rule, a re-inference on unstreamed tool results moves nothing and announces an addressed arrival, naming the re-inference', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    type Routing = { locus?: string; engaged: Set<string>; [field: string]: unknown };
+    const internals = framework as unknown as {
+      turnRouting: Map<string, Routing>; openLogical: Map<string, Routing>; pendingRequests: InferenceRequest[];
+    };
+    const open: Routing = {
+      locus: 'chan-turn', triggerChannel: 'chan-turn', engaged: new Set(['discord:guild:portables']),
+      destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+      addressedElsewhere: new Set(),
+    };
+    internals.turnRouting.set('assistant', open);
+    internals.openLogical.set('assistant', open);
+    await say(framework, 'a message', addressed('discord:dm:antra'));
+    await say(framework, 'a follow-up', ambient('discord:guild:portables'));
+    internals.pendingRequests.push({ agentName: 'assistant', reason: 'tool_results_ready', source: 'framework', timestamp: Date.now() } as InferenceRequest);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Carrying on.', locus: 'chan-turn' }], 'neither arrival moves the locus');
+    assert.deepEqual(movedTo(framework), []);
+    const notices = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
+      .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+    const notice = notices.find((t) => t.includes('addressed you from discord:dm:antra'));
+    assert.ok(notice, 'the addressed arrival is announced');
+    assert.ok(notice!.includes('before this re-inference on your tool results'), `which boundary: ${notice}`);
+    assert.ok(!notices.some((t) => t.includes('discord:guild:portables')), 'a follow-up in an engaged channel addressed nobody and is not announced');
 
     await framework.stop();
   });

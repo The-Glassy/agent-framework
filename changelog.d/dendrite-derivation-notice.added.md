@@ -5,3 +5,8 @@
   what ends it; a resumption says so. Stamped `kind: 'agent-lifecycle'`
   with the record's fields under `dendrite`. No wake, no switch. The fork
   never inherits the notice about itself; an ended source is told nothing.
+  After `dendrite.collapseDerivationNoticesAfter` derivations of one kind
+  from one agent (default 10; 0 never collapses), the source hears a count
+  line every so many instead, with the latest described and
+  `dendrite.collapsed: { count, sinceLastNote }`; the registry and traces
+  keep every record.
