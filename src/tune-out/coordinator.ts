@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { authorLine } from '../author-presentation.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
@@ -36,14 +37,15 @@ const WAKE_COALESCE_MS = 2_000;
 /**
  * One backlog line: author, then the message's blocks in order — text as
  * is, anything else named by kind (`[image]`, `[document]`), so a release
- * never drops a block silently (#232 gap 4).
+ * never drops a block silently (#232 gap 4). The author is named once: a
+ * server that renders `Name: body` into the text itself is not doubled.
  */
 export function renderHeldLine(m: Pick<StoredMessage, 'participant' | 'content' | 'metadata'>): string {
   const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
   const parts = m.content.map((b: ContentBlock) =>
     b.type === 'text' ? (b as Extract<ContentBlock, { type: 'text' }>).text : `[${b.type}]`,
   );
-  return `${author}: ${parts.filter((p) => p.length > 0).join(' ')}`;
+  return authorLine(author, parts.filter((p) => p.length > 0).join(' '));
 }
 
 /** One reader invocation under `reader: 'forks'` (see SubconsciousConfig). */

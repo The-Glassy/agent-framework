@@ -1,4 +1,5 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
+import { presentAuthor } from './author-presentation.js';
 import { dirname, join } from 'node:path';
 import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
@@ -10591,6 +10592,12 @@ export class AgentFramework {
     };
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
+    // Stored as the model reads it: `author: body`. The wire formatter
+    // writes the participant, and channel traffic is stored under the
+    // anonymous `user`, so a body stored bare reaches the model as
+    // `user: <text>` with the author nowhere (Weft's rig, 2026-10-13). A
+    // server that renders the name into the text itself is left as is.
+    const content = presentAuthor({ participant: 'user', content: event.content, metadata }).content;
 
     // Admission (Dendrite §D, #232 root cause A): decided once, here, before
     // anything downstream acts — the hold, the wake gate, who may be woken,
@@ -10642,7 +10649,7 @@ export class AgentFramework {
       const target = this.agents.get(event.deliverTo);
       if (!target) return undefined;
       if (this.conversationRouter && this.registry.homeChannel(target.name) !== undefined) {
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const id = target.getContextManager().addMessage('user', content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
@@ -10663,12 +10670,12 @@ export class AgentFramework {
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      return this.routeConversationIncoming(event, metadata, decision);
+      return this.routeConversationIncoming({ ...event, content }, metadata, decision);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
     // (channels.publish surfaces like portal-mcpl deliver mentions here).
-    const incomingContent = [...event.content];
+    const incomingContent = [...content];
     {
       const invitation = this.buildClosedChannelInvitation({
         serverId: event.serverId,

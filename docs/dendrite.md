@@ -194,6 +194,10 @@ Stored authorship and the role a model sees are different things. `AgentConfig` 
 
 `deriveAgent` with shared inheritance sets `selfParticipants` to the parent (and the parent's own ancestors) and `presentAs` to the name the parent's requests use. The child's new turns are still stored under the child's name.
 
+### The author's name
+
+A channel message is stored as the model reads it: `author: body`. MCPL's `channels/incoming` carries the author as a field — `author: {id, name}` — and the body alone as content; the framework stores it under the anonymous participant `user` with the author in `metadata.author`. The wire formatter writes the participant, and the compiled view carries no metadata, so a body stored bare reached the model as `user: <text>` with the author nowhere, while a release's backlog lines, which read the metadata, named it (first live run, Weft's isolation, 2026-10-13). The rule, `presentAuthor` (exported): a message stored under `user` that names an author has the name written before its first text block — or, with no text block, as a leading `Name:` line before its media — unless the text already begins with `Name:`. A server that renders the name into the text itself (portal-mcpl does) is left as it is, so the name appears once whichever shape a server sends. Backlog lines follow the same rule (`authorLine`), so such a server's messages are no longer shown as `Name: Name: body`.
+
 ### Restricting a fork without losing the prefix
 
 Removing a tool from `allowedTools` changes the tool block at the front of the request, which changes the prefix. `AgentConfig.denyToolsAtDispatch` leaves the tool advertised and refuses the call when it is made.

@@ -1,4 +1,5 @@
 import type { ContentBlock } from '@animalabs/membrane';
+import { authorLine } from '../author-presentation.js';
 import type { StoredMessage } from '@animalabs/context-manager';
 /**
  * The subconscious's tool surface (issue #77).
@@ -234,7 +235,7 @@ export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] 
       .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('\n');
-    lines.push(`${author}: ${text}`);
+    lines.push(authorLine(author, text));
     const media = message.content.filter((b) => b.type !== 'text');
     if (media.length > 0) {
       flush();

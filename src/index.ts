@@ -161,6 +161,7 @@ export type {
 export * from "./tool-presentation.js";
 
 // Tune-out: the subconscious configuration and the default reader-fork framing.
+export { presentAuthor, authorLine, authorNamed, ANONYMOUS_PARTICIPANT } from './author-presentation.js';
 export {
   defaultReaderFraming,
   type SubconsciousConfig,

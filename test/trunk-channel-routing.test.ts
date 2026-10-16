@@ -696,7 +696,7 @@ describe('Residents read one message slot', () => {
     framework.pushEvent(residentIncoming('discord:guild:lounge', 'unrelated chatter', 'shade', false));
     await framework.runUntilIdle();
     assert.ok(framework.getAgent('shade')!.getContextManager().getAllMessages()
-      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'unrelated chatter')),
+      .some((m) => m.content.some((b) => b.type === 'text' && (b as { text: string }).text === 'antra: unrelated chatter')),
     'shade reads the ambient message in the slot');
     await release('shade');
 

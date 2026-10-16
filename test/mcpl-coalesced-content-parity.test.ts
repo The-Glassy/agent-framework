@@ -275,10 +275,12 @@ test('a block whose type, text or source isn\'t a string converts on both lanes,
   await f.framework.runUntilIdle();
   const context = f.context();
   assert(context.includes('sibling_after_malformed'), 'the batch went on past the malformed messages');
-  // Each malformed block, four times: coalesced and not, on each lane.
+  // Each malformed block, four times: coalesced and not, on each lane. A
+  // channel message is stored under its author's name (`User: [...]`), so
+  // the placeholder is matched to the end of its text block.
   for (const shows of new Set(malformed.map((m) => m.shows))) {
     const expected = malformed.filter((m) => m.shows === shows).length * 4;
-    assert.equal(occurrences(context, JSON.stringify(shows)), expected, shows);
+    assert.equal(occurrences(context, `${shows}"`), expected, shows);
   }
   for (const leaked of ['toString', 'array_', '424242']) assert(!context.includes(leaked), `nothing that was not a string reaches the context (${leaked})`);
 });
