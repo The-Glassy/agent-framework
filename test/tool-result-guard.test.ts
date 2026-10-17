@@ -1684,7 +1684,13 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
     edit(id, content);
   };
   let stopping: Promise<void> | undefined;
-  h.membrane.onSubmit = () => { stopping = h.framework.stop(); };
+  // stop() begins once the turn's stream has completed, on its
+  // inference:completed: the guard has accepted the batch, and its edit has
+  // failed once and is queued. (Begun while the round's results were
+  // submitted, at `ready`, stop() would now cancel the turn there.)
+  h.framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && !stopping) stopping = h.framework.stop();
+  });
   try {
     await h.run();
     assert.ok(stopping);
@@ -2246,8 +2252,14 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
 // what is so.
 // ---------------------------------------------------------------------------
 
-test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async () => {
+test('#281: a write still under way at the deadline is named as unfinished, and nothing waits on it longer', async (t) => {
   const h = await workspaceHarness([[calls('one', 'two'), refused()], [answer()]]);
+  // The batch's deadline is a Date.now() time taken when the batch is
+  // queued, and its first write starts only after the steps between, which
+  // a loaded host can stretch past a short deadline. With the clock held
+  // still, the deadline can't be spent before the write starts. The spill's
+  // own timer is a real one, and fires while the stalled write is under way.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const stalled = gate();
   let writes = 0;
@@ -2499,12 +2511,15 @@ test("#281: a disposed run's failed acceptance edit is retried by maintenance, a
   } finally { await h.framework.stop(); }
 });
 
-test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async () => {
+test('#281: batches behind one stalled write cost one deadline: no write starts until it settles', async (t) => {
   const h = await workspaceHarness([
     [calls('one'), refused()], [answer()],
     [calls('two'), refused()], [answer()],
     [calls('three'), refused()], [answer()],
   ]);
+  // As in the test above: with the clock held still, no batch's deadline can
+  // be spent before its write starts, whatever the host's load.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 50;
   const framework = h.framework as unknown as {
     writeToolResultFile: (...args: unknown[]) => Promise<unknown>;
@@ -2529,6 +2544,10 @@ test('#281: batches behind one stalled write cost one deadline: no write starts 
     assert.equal(toolResults(h.framework)[1].content, AUDIT_STUB);
     stalled.open();
     await until(() => framework.stalledSpills.size === 0, 'the stalled write settles');
+    // The third batch's write is a real one, with nothing stalling it, and
+    // the spill's timer is real too: a deadline far beyond what a write here
+    // takes keeps a slow write on a loaded host from being named unfinished.
+    (h.framework as unknown as { withheldSpillDeadlineMs: number }).withheldSpillDeadlineMs = 60_000;
     await bounded(h.run(), 'the third batch');
     assert.equal(writes, 2, 'once it has settled, the next original is written');
     assert.ok(typeof annotated()[2].results[0].path === 'string' && annotated()[2].results[0].unfinished === undefined);
@@ -2592,13 +2611,18 @@ test('#281: stop during a compile that waits for an annotation lets no provider 
   } finally { write.open(); if (!stopped) await h.framework.stop(); }
 });
 
-test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async () => {
+test('#281: writes that stalled together each hold the workspace as unanswered until it settles', async (t) => {
   const h = await workspaceHarness([]);
   const framework = h.framework as unknown as {
     withheldSpillDeadlineMs: number;
     writeToolResultFile: (label: string) => Promise<unknown>;
     spillWithheld: (label: string, text: string, branch: string) => Promise<unknown>;
   };
+  // spillWithheld reads the clock for its deadline and again before the write
+  // starts, with the write's place found between; a pause of the process
+  // there on a loaded host would spend 30 ms. With the clock held still it
+  // can't, and the spill's own timer is a real one.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   framework.withheldSpillDeadlineMs = 30;
   const gates = new Map<string, ReturnType<typeof gate>>([['a', gate()], ['b', gate()]]);
   const started: string[] = [];
@@ -3229,6 +3253,13 @@ test('a framework compile from before stop cannot drive after restart', async ()
     return result;
   };
   let starting: Promise<void> | undefined;
+  // The dropped turn's inference:* events, as a module's trace listener sees them.
+  const turnEvents: Array<{ type: string; reason?: string }> = [];
+  const unsubscribe = framework.onTrace((event) => {
+    if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+      turnEvents.push({ type: event.type, ...('reason' in event ? { reason: String(event.reason) } : {}) });
+    }
+  });
   try {
     const lines: string[] = [];
     const error = console.error;
@@ -3243,11 +3274,111 @@ test('a framework compile from before stop cannot drive after restart', async ()
     } finally { console.error = error; }
     assert.equal(driven, 0);
     assert.ok(lines.some((line) => /stopped and started again/.test(line) && /dropped before it sends anything/.test(line)), lines.join('\n'));
+    // The turn emitted inference:started before its compile, so it gets one
+    // terminal event: a listener's bracket (a typing loop) closes.
+    assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+    assert.match(turnEvents[1]?.reason ?? '', /stopped and started again.*dropped before it sends anything/);
+    unsubscribe();
     // A turn begun after the restart is admitted and drives its stream.
     await (framework as unknown as { startAgentStream(a: typeof agent): Promise<void> }).startAgentStream(agent);
     await until(() => driven === 1, 'the turn begun after the restart drives');
   } finally { compile.open(); await starting; await framework.stop(); store.close(); }
 });
+
+// A turn dropped before it sends anything, at either check: before its
+// compile (it waits in a module's gatherContext) or after it (it waits in its
+// compile). Each way it can lose its place: the framework stops, the agent is
+// removed, the agent object is replaced under its name, or the replacement's
+// own turn already holds the name's turn token.
+for (const phase of ['before', 'after'] as const) {
+  for (const how of ['stopping', 'removed', 'disposed', 'replaced', 'superseded'] as const) {
+    const title = { stopping: 'the framework stopping', removed: 'its agent removed',
+      disposed: 'its run disposed with its record', replaced: 'its agent replaced',
+      superseded: "a newer turn of its agent's name running" }[how];
+    test(`a turn dropped ${phase} its compile, with ${title}, ${how === 'superseded' ? "leaves the newer turn's bracket alone" : 'ends with inference:aborted'}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `guard-drop-${phase}-compile-`)); dirs.push(dir);
+      const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+      const membrane = new ScriptMembrane([[answer()]]);
+      const framework = await AgentFramework.create({ store, membrane: membrane.asMembrane(),
+        agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }],
+        modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+      const agent = framework.getAgent('assistant')!;
+      const internal = framework as unknown as {
+        moduleRegistry: { gatherContext: (n: string) => Promise<unknown[]> };
+        agents: Map<string, unknown>;
+        activeTurnTokens: Map<string, number>;
+        lastInferenceAt: Map<string, { startedAt?: number; endedAt?: number }>;
+      };
+      const held = gate();
+      const entered = gate();
+      if (phase === 'before') {
+        internal.moduleRegistry.gatherContext = async () => { entered.open(); await held.opened; return []; };
+      } else {
+        const build = agent.buildActivationRequest.bind(agent);
+        agent.buildActivationRequest = async (...args) => { entered.open(); await held.opened; return build(...args); };
+      }
+      const turnEvents: Array<{ type: string; reason?: string; durationMs?: number }> = [];
+      framework.onTrace((event) => {
+        if (event.type.startsWith('inference:') && (event as { agentName?: string }).agentName === 'assistant') {
+          turnEvents.push({ type: event.type,
+            ...('reason' in event ? { reason: String(event.reason) } : {}),
+            ...('durationMs' in event ? { durationMs: Number(event.durationMs) } : {}) });
+        }
+      });
+      const lines: string[] = [];
+      const error = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      const heldMs = 25;
+      let starting: Promise<unknown> | undefined;
+      try {
+        starting = (framework as unknown as { startAgentStream(a: typeof agent): Promise<unknown> }).startAgentStream(agent);
+        await entered.opened;
+        if (how === 'stopping') await framework.stop();
+        else if (how === 'removed') internal.agents.delete('assistant');
+        else if (how === 'disposed') {
+          // As runEphemeralToCompletion's disposal does: the agent, its record and its token go.
+          internal.agents.delete('assistant');
+          internal.lastInferenceAt.delete('assistant');
+          internal.activeTurnTokens.delete('assistant');
+        } else {
+          internal.agents.set('assistant', Object.create(agent));
+          if (how === 'superseded') internal.activeTurnTokens.set('assistant', -1);
+        }
+        await new Promise((resolve) => setTimeout(resolve, heldMs));
+        held.open();
+        await starting;
+      } finally { console.error = error; held.open(); await starting; }
+      try {
+        const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
+        const reason = `a turn ${phase === 'before' ? 'assembled' : 'compiled'} while ${why} is dropped before it sends anything`;
+        assert.ok(lines.some((line) => line.includes(reason)), lines.join('\n'));
+        const last = internal.lastInferenceAt.get('assistant');
+        if (how === 'superseded') {
+          // The terminal event and lastInference carry only the name, so they
+          // would end the newer turn: the dropped frame emits and records nothing.
+          assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started']);
+          assert.equal(last?.endedAt, undefined);
+        } else {
+          assert.deepEqual(turnEvents.map((event) => event.type), ['inference:started', 'inference:aborted']);
+          assert.equal(turnEvents[1]?.reason, reason);
+          const durationMs = turnEvents[1]?.durationMs ?? NaN;
+          assert.ok(Number.isFinite(durationMs) && durationMs >= heldMs - 5 && durationMs < 60_000, `durationMs ${durationMs}`);
+          if (how === 'disposed') {
+            // The terminal event still closes a listener's bracket, but the
+            // disposed name gets no record back.
+            assert.equal(internal.lastInferenceAt.has('assistant'), false, JSON.stringify(last));
+          } else {
+            assert.ok(last?.endedAt !== undefined && last.endedAt >= (last.startedAt ?? Infinity), JSON.stringify(last));
+          }
+        }
+      } finally {
+        if (how === 'superseded') internal.activeTurnTokens.delete('assistant');
+        if (how !== 'stopping') internal.agents.set('assistant', agent);
+        await framework.stop(); store.close();
+      }
+    });
+  }
+}
 
 // Drain async storage/annotation continuations without advancing deadline time.
 async function flushAsync() {

@@ -11,3 +11,10 @@
   Entry and release are announced in the excepted channel as one bracketed
   line each under the resident's name (`tuneOut.announce`, default true;
   traced `tune-out:announced` / `tune-out:announce-failed`).
+  Its end time and cadence hold any length: both run on timers no longer
+  than one holds, as a channel's tune-out does since 0.22.2, so a hold or a
+  cadence past 24.8 days ends or ticks when it should rather than at once.
+  `focus` reads its options as `tune_out` does: a value that gives no finite
+  number is refused, naming it, before anything changes; a numeric string is
+  read as its number; a `null` option counts as left out; and the duration
+  is still required.

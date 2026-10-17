@@ -1,5 +1,7 @@
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
+import { ContextManager, continuesBody, type BodyShard } from '@animalabs/context-manager';
+import { removeStoredInterval } from '../stored-removal.js';
+import { firstFreeBranchName } from '../branch-names.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -21,6 +23,7 @@ export interface OfflineRecoveryBranchOptions {
   suppressMessageIds?: string[];
   /** Inclusive context-order ranges between Discord message endpoints. */
   suppressRanges?: Array<{ fromMessageId: string; toMessageId: string }>;
+  /** Defaults to `recovery/{agentName}/{ms}`, or with `-2`, `-3`, … appended when the store already holds that name. */
   branchName?: string;
   /** Defaults to the primary-agent namespace `agents/{agentName}`. */
   namespace?: string;
@@ -160,8 +163,9 @@ export async function createOfflineRecoveryBranch(
     refs = dedupeDiscordRefs([...refs, ...suppression.refs]);
 
     const sourceBranch = store.currentBranch().name;
+    const held = new Set(store.listBranches().map((branch) => branch.name));
     const targetBranch = options.branchName
-      ?? `recovery/${options.agentName}/${Date.now()}`;
+      ?? firstFreeBranchName(`recovery/${options.agentName}/${Date.now()}`, (name) => held.has(name));
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
@@ -202,11 +206,12 @@ export async function createOfflineRecoveryBranch(
     const createdBranch = contextManager.branchAt(target.id, targetBranch);
     try {
       await contextManager.switchBranch(createdBranch);
-      // Work from newest to oldest so earlier redactions never perturb the
-      // live positions used by later range endpoints.
+      // Each interval is removed by its messages' ids, so the order doesn't
+      // change the result. removeStoredInterval takes a single message outside
+      // any body through removeMessage, and a shard or a longer interval as a
+      // range, which refuses one that splits a body.
       for (const interval of [...suppression.intervals].reverse()) {
-        if (interval.fromId === interval.toId) contextManager.removeMessage(interval.fromId);
-        else contextManager.removeMessages(interval.fromId, interval.toId);
+        removeStoredInterval(contextManager, interval.fromId, interval.toId);
       }
       if (batch) outbox.activate(batch.id);
     } catch (error) {
@@ -238,9 +243,7 @@ interface SuppressionInterval {
 
 interface MessageLocation {
   first: number;
-  last: number;
   firstId: StoredWindowMessage['id'];
-  lastId: StoredWindowMessage['id'];
   /** Usually one run; multiple runs tolerate duplicate external metadata. */
   runs: SuppressionInterval[];
 }
@@ -299,14 +302,15 @@ function validateAnchorBoundary(
   total: number,
   target: StoredWindowMessage,
 ): void {
-  const groupId = (target as StoredWindowMessage & { bodyGroupId?: string }).bodyGroupId;
-  if (!groupId || targetIndex + 1 >= total) return;
+  if (targetIndex + 1 >= total) return;
   const next = contextManager.getMessageWindow(targetIndex + 1, 1, {
     resolveBlobs: false,
-  }).messages[0] as (StoredWindowMessage & { bodyGroupId?: string }) | undefined;
-  if (next?.bodyGroupId === groupId) {
+  }).messages[0];
+  // A body continues only into a later shard of the same ingestion: a
+  // reposted document shares its group id but starts a body of its own.
+  if (continuesBody(target as BodyShard, next as BodyShard | undefined)) {
     throw new Error(
-      `Recovery anchor ${String(target.id)} splits body group ${groupId}; choose its final shard.`,
+      `Recovery anchor ${String(target.id)} splits body group ${(target as BodyShard).bodyGroupId}; choose its final shard.`,
     );
   }
 }
@@ -321,7 +325,9 @@ function validateRemovalIntegrity(
     index >= interval.start && index <= interval.end);
   const toolUses = new Map<string, boolean>();
   const toolResults = new Map<string, boolean>();
-  const groupMembership = new Map<string, boolean>();
+  // The message before, in store order: a selection splits a body when a
+  // message continuing the one before it lands on the other side.
+  let previous: { message: BodyShard; removed: boolean } | null = null;
 
   for (let offset = 0; offset < total; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
@@ -332,16 +338,14 @@ function validateRemovalIntegrity(
     for (let i = 0; i < messages.length; i++) {
       const index = offset + i;
       const isRemoved = removed(index);
-      const message = messages[i] as StoredWindowMessage & { bodyGroupId?: string };
-      if (message.bodyGroupId) {
-        const prior = groupMembership.get(message.bodyGroupId);
-        if (prior !== undefined && prior !== isRemoved) {
-          throw new Error(
-            `Recovery selection splits body group ${message.bodyGroupId}; adjust the anchor or suppression boundary.`,
-          );
-        }
-        groupMembership.set(message.bodyGroupId, isRemoved);
+      const message = messages[i];
+      const shard = message as BodyShard;
+      if (previous && previous.removed !== isRemoved && continuesBody(previous.message, shard)) {
+        throw new Error(
+          `Recovery selection splits body group ${shard.bodyGroupId}; adjust the anchor or suppression boundary.`,
+        );
       }
+      previous = { message: shard, removed: isRemoved };
       for (const rawBlock of message.content) {
         const block = rawBlock as { type?: unknown; id?: unknown; toolUseId?: unknown };
         if (block.type === 'tool_use' && typeof block.id === 'string') {
@@ -402,9 +406,7 @@ function buildSuppressionPlan(
         };
         locations.set(externalId, {
           first: index,
-          last: index,
           firstId: messages[i].id,
-          lastId: messages[i].id,
           runs: [run],
         });
       } else {
@@ -420,8 +422,6 @@ function buildSuppressionPlan(
             toId: messages[i].id,
           });
         }
-        location.last = index;
-        location.lastId = messages[i].id;
       }
     }
   }
@@ -444,12 +444,19 @@ function buildSuppressionPlan(
     const to = locations.get(range.toMessageId)!;
     const earlier = from.first <= to.first ? from : to;
     const later = from.first <= to.first ? to : from;
+    // What's between the two messages, after the earlier one began and
+    // before the later one began: from the earlier one's first stored copy
+    // through the later one's first. Each end is every copy of it besides,
+    // as a single suppression is, so a copy stored outside that span (a
+    // write cut short and retried later) is taken on its own, and nothing
+    // else stored after the later one began is taken.
     intervals.push({
       start: earlier.first,
-      end: later.last,
+      end: later.first,
       fromId: earlier.firstId,
-      toId: later.lastId,
+      toId: later.firstId,
     });
+    for (const end of [from, to]) intervals.push(...end.runs.map((run) => ({ ...run })));
   }
 
   intervals.sort((a, b) => a.start - b.start || a.end - b.end);

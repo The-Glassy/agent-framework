@@ -15,7 +15,7 @@ import { openTransport, type McplTransport, type TransportCloseInfo } from './tr
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED } from './errors.js';
-import { logValue } from './log-value.js';
+import { logDetail, logValue } from './log-value.js';
 
 import type {
   McplServerConfig,
@@ -66,6 +66,9 @@ export interface McplConnectionCloseInfo {
   signal: NodeJS.Signals | null;
   /** WebSocket close reason, or a short description of the cause. */
   reason?: string;
+  /** True when `reason` is the peer's own text, a WebSocket server's close
+   *  reason, rather than the transport's or the host's words. */
+  reasonFromPeer?: boolean;
   /** True when the host closed the link (`close()` / `reconnectAfterFailure()`),
    *  false when the transport dropped unexpectedly. */
   byHost: boolean;
@@ -74,6 +77,37 @@ export interface McplConnectionCloseInfo {
 /** Timeout for the initialize handshake in milliseconds.
  *  Spring Boot + JDA servers can take 5-10s to boot, so 30s is safe. */
 const INITIALIZE_TIMEOUT_MS = 30_000;
+
+/** A failed connect's `stderrTail`, the last of the server's stderr that its
+ *  handshake's error keeps, when there is one. */
+export function stderrTailOf(error: unknown): string | undefined {
+  const tail = (error as { stderrTail?: unknown } | null | undefined)?.stderrTail;
+  return typeof tail === 'string' && tail !== '' ? tail : undefined;
+}
+
+/** For the host's own log line about a failed connect: the server's stderr
+ *  that the error keeps as `stderrTail`, one marked line per line of it,
+ *  each through log-value, since it's the server's text. '' when there's
+ *  none. */
+export function withStderr(error: unknown): string {
+  const tail = stderrTailOf(error);
+  if (tail === undefined) return '';
+  return '. The last of its stderr:' + tail.split('\n').map((line) => `\n  stderr: ${logDetail(line)}`).join('');
+}
+
+/** A transport close's reason, as an error message gives it: the transport's
+ *  own words. A WebSocket peer's close reason is the server's text
+ *  (`reasonFromPeer`), so an error gives the words the transport uses for a
+ *  close without one, as `mcpl:server-closed` leaves that text out. A
+ *  WebSocket close's code, a number, says what the server meant (4001: a
+ *  refused credential), with or without a reason, so each error gives it too:
+ *  a pending request's error has `code=`, and the handshake's adds it for any
+ *  WebSocket close, since a close before the handshake completes reaches no
+ *  'close' event. A stdio child's exit reads as before. */
+function closeReasonText(info: TransportCloseInfo): string {
+  if (info.reasonFromPeer) return 'websocket closed';
+  return info.reason ?? 'unknown';
+}
 
 /** Default per-request timeout in milliseconds (see McplServerConfig.requestTimeoutMs).
  *  A live-but-wedged server (accepts requests, never answers, never closes its
@@ -117,8 +151,13 @@ interface RequestOptions {
  * - `'channels-incoming'`  — Server sent `channels/incoming`
  * - `'error'`              — Connection-level error
  * - `'close'`              — Connection closed: `(code, signal, info: McplConnectionCloseInfo)`
- * - `'connect-failed'`     — Initial connect failed; background retry scheduled
- * - `'reconnect-failed'`   — A background reconnect attempt failed; next retry scheduled
+ * - `'connect-failed'`     — Initial connect failed; background retry scheduled:
+ *   `{ error, stderrTail?, attempt }`
+ * - `'reconnect-failed'`   — A background reconnect attempt failed; next retry scheduled:
+ *   `{ error, stderrTail?, attempt }`. `stderrTail` is the last of the
+ *   server's stderr when its handshake failed by its transport closing, a
+ *   transport error or its timeout and it had written any; `error` never
+ *   carries it.
  * - `'reconnect'`          — Background reconnect succeeded
  */
 export class McplServerConnection extends EventEmitter {
@@ -309,10 +348,14 @@ export class McplServerConnection extends EventEmitter {
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
+    // The cap's drops are counted per pause: this flush ends one, so its line
+    // reports that pause's drops, and the next pause counts (and logs) its own.
+    const dropped = this.droppedBufferedEvents;
+    this.droppedBufferedEvents = 0;
     if (pending.length > 200) {
       console.error(
         `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
-        `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
+        `(long pause backlog${dropped > 0 ? `; ${dropped} dropped at cap` : ''})`,
       );
     }
     this.flushDepth++;
@@ -508,8 +551,9 @@ export class McplServerConnection extends EventEmitter {
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-    // Store config for reconnection
-    if (config.reconnect) {
+    // Store config for reconnection. Only `true` turns reconnect on, as at
+    // every other reader of it.
+    if (config.reconnect === true) {
       connection.config = config;
       connection.hostCapabilities = hostCapabilities;
       connection.reconnectEnabled = true;
@@ -532,6 +576,15 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
     const transport = await openTransport(config);
+    // Once the handshake stops listening for 'error', this logs what the
+    // transport reports, until the handshake hands the transport on, or for
+    // good if the handshake fails. EventEmitter throws an 'error' that has no
+    // listener, and from an I/O callback nothing catches it. A malformed
+    // WebSocket frame that arrives with the initialize response, or while a
+    // failed handshake's close() runs, is such an error.
+    const logAfterSettled = (err: Error) => {
+      console.error(`[mcpl] ${config.id}: transport error after the handshake settled: ${err.message}`);
+    };
 
     try {
       const initId = 0; // use id=0 for the handshake
@@ -549,10 +602,20 @@ export class McplServerConnection extends EventEmitter {
       // Await the initialize response, racing an early transport close/error and
       // a timeout. All three paths clean up their listeners.
       const { mcpl: rawCapabilities, mcpToolsAdvertised } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean }>((resolve, reject) => {
+        // When the transport fails, the end of the server's stderr often says
+        // why, such as a missing token or a crash at startup. It goes on the
+        // error as `stderrTail`, never into the message: an error's message
+        // travels to traces and tool results, and a server's stderr is its
+        // own text, which can hold a credential.
+        const failed = (failure: string): Error & { stderrTail?: string } => {
+          const tail = transport.stderrTail.trimEnd();
+          return Object.assign(new Error(failure), tail ? { stderrTail: tail } : {});
+        };
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
           transport.off('error', onError);
+          transport.on('error', logAfterSettled);
           clearTimeout(timer);
         };
         const onLine = (line: string) => {
@@ -581,15 +644,16 @@ export class McplServerConnection extends EventEmitter {
         };
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
-          reject(new Error(`MCPL server "${config.id}" transport closed before handshake completed (${info.reason ?? 'unknown'})`));
+          const code = transport.kind === 'websocket' && typeof info.code === 'number' ? `, code ${info.code}` : '';
+          reject(failed(`MCPL server "${config.id}" transport closed before handshake completed (${closeReasonText(info)}${code})`));
         };
         const onError = (err: Error) => {
           cleanup();
-          reject(new Error(`MCPL server "${config.id}" transport error during handshake: ${err.message}`));
+          reject(failed(`MCPL server "${config.id}" transport error during handshake: ${err.message}`));
         };
         const timer = setTimeout(() => {
           cleanup();
-          reject(new Error(`MCPL server "${config.id}" initialize handshake timed out`));
+          reject(failed(`MCPL server "${config.id}" initialize handshake timed out`));
         }, INITIALIZE_TIMEOUT_MS);
 
         transport.on('line', onLine);
@@ -614,6 +678,10 @@ export class McplServerConnection extends EventEmitter {
         console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.map(logValue).join(', ')}`);
       }
 
+      // The caller wires the transport, or keeps it for close() with a
+      // listener of its own, in the continuation of this return, before any
+      // I/O callback can emit.
+      transport.off('error', logAfterSettled);
       return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
@@ -635,17 +703,18 @@ export class McplServerConnection extends EventEmitter {
     try {
       return await McplServerConnection.connect(config, hostCapabilities);
     } catch (error) {
-      if (!config.reconnect) {
+      if (config.reconnect !== true) {
         throw error;
       }
 
       // Non-blocking start: create a disconnected stub that will reconnect in background
-      console.error(`MCPL server "${config.id}" initial connect failed, will retry:`, (error as Error).message);
+      console.error(`MCPL server "${config.id}" initial connect failed, will retry: ${(error as Error).message}${withStderr(error)}`);
       const stub = McplServerConnection.createDisconnectedStub(config, hostCapabilities);
       // Surface the initial failure. The event is buffered by the emit()
       // override until the host wires listeners and calls ready(), so it is
       // not lost in the window before wireMcplEvents runs.
-      stub.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
+      const stderrTail = stderrTailOf(error);
+      stub.emit('connect-failed', { error: (error as Error).message, ...(stderrTail ? { stderrTail } : {}), attempt: 0 });
       return stub;
     }
   }
@@ -990,6 +1059,13 @@ export class McplServerConnection extends EventEmitter {
         // The prior transport was disconnected before this retry began. Keep
         // the fresh, unadmitted transport owned by close(), including on a
         // failed transport cleanup, instead of reviving a stopped connection.
+        // It isn't wired, and the handshake has removed its own listeners, so
+        // an error it reports from here on, such as a malformed frame from a
+        // WebSocket server while close() closes it, is logged here rather than
+        // thrown where nothing catches it.
+        transport.on('error', (err: Error) => {
+          console.error(`[mcpl] ${this.id}: a transport kept for close() reported an error: ${err.message}`);
+        });
         this.transport = transport;
         return;
       }
@@ -1014,9 +1090,10 @@ export class McplServerConnection extends EventEmitter {
       this.reconnectAttempts = 0;
       this.emit('reconnect', { attempts: attempt });
     } catch (error) {
-      console.error(`MCPL server "${this.id}" reconnect failed:`, (error as Error).message);
+      console.error(`MCPL server "${this.id}" reconnect failed: ${(error as Error).message}${withStderr(error)}`);
       this.reconnectAttempts = attempt + 1;
-      this.emit('reconnect-failed', { error: (error as Error).message, attempt });
+      const stderrTail = stderrTailOf(error);
+      this.emit('reconnect-failed', { error: (error as Error).message, ...(stderrTail ? { stderrTail } : {}), attempt });
       this.scheduleReconnect();
     }
   }
@@ -1338,7 +1415,7 @@ export class McplServerConnection extends EventEmitter {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
             new Error(
-              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${info.reason ?? 'unknown'}) while awaiting ${pending.method} (id=${id})`,
+              `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${closeReasonText(info)}) while awaiting ${pending.method} (id=${id})`,
             ),
           );
         }
@@ -1356,6 +1433,7 @@ export class McplServerConnection extends EventEmitter {
           code: info.code ?? null,
           signal: info.signal ?? null,
           reason: info.reason ?? (byHost ? 'closed by host' : undefined),
+          ...(info.reasonFromPeer ? { reasonFromPeer: true } : {}),
           byHost,
         };
         this.emit('close', closeInfo.code, closeInfo.signal, closeInfo);
