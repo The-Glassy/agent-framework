@@ -112,6 +112,59 @@ describe('author presentation', () => {
     });
   });
 
+  describe('on the wire, delivered to a conversation fork', () => {
+    let tempDir: string;
+    let membrane: MockMembrane;
+    let framework: AgentFramework;
+
+    beforeEach(async () => {
+      tempDir = mkdtempSync(join(tmpdir(), 'author-presentation-fork-'));
+      membrane = new MockMembrane();
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+        modules: [],
+        conversations: { templateAgent: 'trunk' },
+      });
+    });
+
+    afterEach(async () => {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+
+    const dm = (text: string, extra: Record<string, unknown> = {}): ProcessEvent => ({
+      ...(incoming(text) as unknown as Record<string, unknown>),
+      channelId: 'probe:dm:zinnia',
+      metadata: { channel_type: 'im' },
+      ...extra,
+    }) as unknown as ProcessEvent;
+
+    it('a routed message and a correction delivered to the fork by name (deliverTo) are both stored under the author', async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hello.' }]));
+      framework.pushEvent(dm('hello there'));
+      await framework.runUntilIdle();
+      const fork = framework.getConversationRouter()!.getBinding('probe:dm:zinnia')!.agentName;
+      assert.ok(framework.getAgent(fork), 'the DM spawned a fork');
+
+      // RFC-006: a replacement notice follows its delivery into the agent
+      // that holds the prior occurrence, named by `deliverTo`.
+      const internals = framework as unknown as { handleMcplChannelIncoming(event: unknown): Promise<unknown> };
+      await internals.handleMcplChannelIncoming(dm('hello there (edited)', { triggerInference: false, deliverTo: fork }));
+
+      const stored = framework.getAgent(fork)!.getContextManager().getAllMessages()
+        .filter((m) => m.participant === 'user')
+        .map((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join(''));
+      assert.ok(stored.includes('Zinnia-Probe: hello there'), `the routed message names its author:\n${stored.join('\n')}`);
+      assert.ok(stored.includes('Zinnia-Probe: hello there (edited)'), `the deliverTo correction names its author:\n${stored.join('\n')}`);
+      assert.ok(
+        !framework.getAgent('trunk')!.getContextManager().getAllMessages().some((m) => JSON.stringify(m.content).includes('hello there')),
+        'the trunk holds neither',
+      );
+    });
+  });
+
   describe('the rule', () => {
     const stored = (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>) =>
       ({ participant, content, ...(metadata ? { metadata } : {}) });
