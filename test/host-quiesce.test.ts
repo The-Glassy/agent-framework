@@ -21,6 +21,7 @@ import type {
 } from '@animalabs/context-manager';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/membrane';
+import { JsStore } from '@animalabs/chronicle';
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
 import type { TraceEvent } from '../src/types/trace.js';
@@ -263,6 +264,272 @@ test('quiesce persists across restart; resume clears it durably', async () => {
   }
 });
 
+/** Run `body` while the host-mode record's write fails: the recovery file's,
+ *  or framework/state's when there's no recovery file. */
+async function withFailingHostModeWrite(body: () => Promise<void>): Promise<void> {
+  const framework = AgentFramework.prototype as unknown as { writeRecoveryFile(path: string, document: unknown): void };
+  const writeFile = framework.writeRecoveryFile;
+  const store = JsStore.prototype as unknown as { setStateJson(this: JsStore, id: string, value: unknown): void };
+  const setState = store.setStateJson;
+  framework.writeRecoveryFile = function (this: unknown, path: string, document: unknown) {
+    if (path.endsWith('host-mode.json')) throw Object.assign(new Error('injected EACCES writing host-mode.json'), { code: 'EACCES' });
+    return writeFile.call(this, path, document);
+  };
+  store.setStateJson = function (this: JsStore, id: string, value: unknown) {
+    if (id === 'framework/state' && new Error().stack?.includes('persistHostMode')) throw new Error('injected EIO writing framework/state');
+    return setState.call(this, id, value);
+  };
+  try {
+    await body();
+  } finally {
+    framework.writeRecoveryFile = writeFile;
+    store.setStateJson = setState;
+  }
+}
+
+/** console.error's lines until restore(), kept instead of printed. */
+function captureErrors(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  return { lines, restore: () => { console.error = original; } };
+}
+
+/** Run `body` while the store's sync after a host-mode write fails. */
+async function withFailingHostModeSync(body: () => Promise<void>): Promise<void> {
+  const store = JsStore.prototype as unknown as { sync(this: JsStore): void };
+  const sync = store.sync;
+  store.sync = function (this: JsStore) {
+    if (new Error().stack?.includes('persistHostMode')) throw new Error('injected EIO syncing the store');
+    return sync.call(this);
+  };
+  try {
+    await body();
+  } finally {
+    store.sync = sync;
+  }
+}
+
+/** A framework on a recovery file or a store only, with a restart that, store
+ *  only, closes the store and opens it again, and the record's quiesced. */
+async function hostModeFixture(where: 'recovery file' | 'store only') {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-record-'));
+  const storePath = join(dir, 'store');
+  let store = where === 'store only' ? JsStore.openOrCreate({ path: storePath }) : undefined;
+  const config = () => ({
+    ...(store ? { store } : { storePath }),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  const f = { framework: await AgentFramework.create(config()) };
+  return {
+    get framework() { return f.framework; },
+    async restart(): Promise<void> {
+      await f.framework.stop();
+      if (store) {
+        store.close();
+        store = JsStore.openOrCreate({ path: storePath });
+      }
+      f.framework = await AgentFramework.create(config());
+    },
+    /** The record's quiesced: the recovery file's, or framework/state's hostMode. */
+    recorded(): unknown {
+      if (store) return (store.getStateJson('framework/state') as { hostMode?: { quiesced?: unknown } } | null)?.hostMode?.quiesced;
+      const file = join(storePath, 'recovery', 'host-mode.json');
+      return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as { quiesced?: unknown }).quiesced : undefined;
+    },
+    async close(): Promise<void> {
+      await f.framework.stop();
+      store?.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("a quiesce whose host-mode write fails leaves the host serving and its record unchanged, and the next quiesce writes it", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const h = await hostModeFixture(where);
+    try {
+      await withFailingHostModeWrite(async () => {
+        await assert.rejects(h.framework.quiesce({ reason: 'surgery' }), {
+          message: where === 'store only' ? 'injected EIO writing framework/state' : 'injected EACCES writing host-mode.json',
+        });
+      });
+      const status = h.framework.getHostModeStatus();
+      assert.equal(status.quiesced, false, `${where}: the host is still serving`);
+      assert.equal(status.reason, undefined, `${where}: no quiesce reason`);
+      assert.equal(status.since, undefined, `${where}: no quiesce time`);
+      assert.equal(h.recorded(), undefined, `${where}: no record was written`);
+      (h.framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'after' }]);
+      assert.equal(h.framework.getHostModeStatus().deferredWrites, 0, `${where}: the context write isn't deferred`);
+      const texts = h.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text?: string } | undefined)?.text);
+      assert.ok(texts.includes('after'), `${where}: the context write lands`);
+      await h.restart();
+      assert.equal(h.framework.getHostModeStatus().quiesced, false, `${where}: a restart after the failed quiesce boots serving`);
+      await h.framework.quiesce({ reason: 'surgery' });
+      const since = h.framework.getHostModeStatus().since;
+      assert.equal(h.framework.getHostModeStatus().quiesced, true, `${where}: the next quiesce quiesces`);
+      assert.equal(h.recorded(), true, `${where}: and writes the record`);
+      await h.restart();
+      const restored = h.framework.getHostModeStatus();
+      assert.equal(restored.quiesced, true, `${where}: a restart then boots quiesced`);
+      assert.equal(restored.reason, 'surgery', `${where}: with the reason`);
+      assert.equal(restored.since, since, `${where}: and the time it recorded`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("a resume whose record clear fails rejects with the record still quiesced, and a retried resume clears it", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    // Quiesced by this process's quiesce(), or by the record at a quiesced boot.
+    for (const booted of [false, true]) {
+      const label = `${where}${booted ? ', booted quiesced' : ''}`;
+      const h = await hostModeFixture(where);
+      try {
+        // A resume() that cleared the record leaves nothing to clear: the next
+        // resume() on the serving host writes nothing, so a failing write doesn't reach it.
+        await h.framework.quiesce({ reason: 'surgery' });
+        await h.framework.resume();
+        await withFailingHostModeWrite(() => h.framework.resume().then(() => {}));
+        await h.framework.quiesce({ reason: 'surgery' });
+        if (booted) await h.restart();
+        assert.equal(h.framework.getHostModeStatus().quiesced, true, `${label}: quiesced`);
+        await withFailingHostModeWrite(async () => {
+          await assert.rejects(h.framework.resume(), {
+            message: where === 'store only' ? 'injected EIO writing framework/state' : 'injected EACCES writing host-mode.json',
+          });
+        });
+        assert.equal(h.framework.getHostModeStatus().quiesced, false, `${label}: resume() serves before it clears the record`);
+        assert.equal(h.recorded(), true, `${label}: the record still says quiesced`);
+        // A retry whose clear fails too rejects, and the clear is still owed.
+        await withFailingHostModeWrite(async () => {
+          await assert.rejects(h.framework.resume(), {
+            message: where === 'store only' ? 'injected EIO writing framework/state' : 'injected EACCES writing host-mode.json',
+          });
+        });
+        assert.equal(h.recorded(), true, `${label}: a retry whose clear fails leaves the record quiesced`);
+        await h.framework.resume();
+        assert.notEqual(h.recorded(), true, `${label}: the next retried resume() clears the record`);
+        // Cleared, a resume() on the serving host writes nothing, so a failing write doesn't reach it.
+        await withFailingHostModeWrite(() => h.framework.resume().then(() => {}));
+        await h.restart();
+        assert.equal(h.framework.getHostModeStatus().quiesced, false, `${label}: a restart then boots serving`);
+      } finally {
+        await h.close();
+      }
+    }
+  }
+});
+
+test("a resume() that would clear the record of a serving host waits out a surgery, as resume() does on a quiesced one", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const h = await hostModeFixture(where);
+    const internals = h.framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    try {
+      await h.framework.quiesce({ reason: 'surgery' });
+      await withFailingHostModeWrite(async () => {
+        await assert.rejects(h.framework.resume());
+      });
+      assert.equal(h.recorded(), true, `${where}: the record still says quiesced`);
+      internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+      try {
+        await assert.rejects(h.framework.resume(), {
+          message: 'Cannot resume: a live rollback for agent holds the store — retry when it completes',
+        });
+        assert.equal(h.recorded(), true, `${where}: refused, it writes nothing`);
+      } finally {
+        internals.surgeryHold = null;
+      }
+      await h.framework.resume();
+      assert.notEqual(h.recorded(), true, `${where}: once the surgery is done, resume() clears the record`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("a resume() during another resume()'s flush leaves the record to it, and it clears the record once its flush is done", async () => {
+  for (const where of ['recovery file', 'store only'] as const) {
+    const h = await hostModeFixture(where);
+    try {
+      await h.framework.quiesce({ reason: 'surgery' });
+      (h.framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text: 'deferred' }]);
+      // Hold the first resume() in its flush of the deferred writes.
+      const internals = h.framework as unknown as { flushDeferredWrites(reason: string): Promise<unknown> };
+      const flush = internals.flushDeferredWrites.bind(h.framework);
+      let entered!: () => void;
+      const inFlush = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      internals.flushDeferredWrites = async (reason: string) => { entered(); await held; return flush(reason); };
+      const first = h.framework.resume();
+      try {
+        // A first resume() that settles without reaching its flush doesn't leave the test waiting here.
+        await Promise.race([inFlush, first.then(() => {}, () => {})]);
+        const status = await h.framework.resume();
+        assert.equal(status.quiesced, false, `${where}: the second resume() answers serving`);
+        assert.equal(h.recorded(), true, `${where}: and leaves the record to the first, mid-flush`);
+      } finally {
+        // Released whatever the assertions found, so stop() isn't left waiting on the first resume().
+        release();
+        await first.catch(() => {});
+      }
+      await first;
+      assert.notEqual(h.recorded(), true, `${where}: the first clears it once its flush is done`);
+      const texts = h.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text?: string } | undefined)?.text);
+      assert.ok(texts.includes('deferred'), `${where}: and its flush landed the deferred write`);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("store only, a host-mode change whose sync fails rejects; with a recovery file, the file is the record and a failed sync of the store is only logged", async () => {
+  const logged = captureErrors();
+  try {
+    const slot = await hostModeFixture('store only');
+    try {
+      await withFailingHostModeSync(async () => {
+        await assert.rejects(slot.framework.quiesce({ reason: 'surgery' }), { message: 'injected EIO syncing the store' });
+      });
+      assert.equal(slot.framework.getHostModeStatus().quiesced, false, 'store only: a quiesce whose sync failed leaves the host serving');
+      // The write reached the store before its sync failed, so the record may say quiesced: a resume() clears it.
+      await slot.framework.resume();
+      assert.notEqual(slot.recorded(), true, 'store only: resume() clears a record the failed quiesce may have left');
+      await slot.restart();
+      assert.equal(slot.framework.getHostModeStatus().quiesced, false, 'store only: and a restart boots serving');
+      await slot.framework.quiesce({ reason: 'surgery' });
+      await withFailingHostModeSync(async () => {
+        await assert.rejects(slot.framework.resume(), { message: 'injected EIO syncing the store' });
+      });
+      await slot.framework.resume();
+      assert.notEqual(slot.recorded(), true, 'store only: a resume whose sync failed is cleared by the next');
+    } finally {
+      await slot.close();
+    }
+    const file = await hostModeFixture('recovery file');
+    try {
+      await withFailingHostModeSync(async () => {
+        await file.framework.quiesce({ reason: 'surgery' });
+      });
+      assert.equal(file.framework.getHostModeStatus().quiesced, true, 'recovery file: the quiesce holds');
+      assert.equal(file.recorded(), true, 'recovery file: the file says quiesced');
+      assert.ok(logged.lines.some((l) => l.includes('store sync after host-mode change failed')), 'recovery file: the failed sync is logged');
+      await file.restart();
+      assert.equal(file.framework.getHostModeStatus().quiesced, true, 'recovery file: a restart boots quiesced');
+    } finally {
+      await file.close();
+    }
+  } finally {
+    logged.restore();
+  }
+});
+
 test('resume gates on a fresh feasibility verdict; force overrides', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
@@ -500,7 +767,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [] });
     else if (m.id === 900) log('push-response', { error: m.error ?? null });
     else if (m.id === 901) log('resume-response', { result: m.result ?? null, error: m.error ?? null });
@@ -715,10 +982,93 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     assert.ok(traces.some((t) => t.type === 'inference:aborted'
       && (t as { reason?: string }).reason === 'quiesce_abandoned'));
     assert.ok(!traces.some((t) => t.type === 'inference:exhausted'));
+    // The cancel provenance is read BEFORE the failure accounting: the same
+    // stream must not be reported failed and then aborted.
+    assert.ok(!traces.some((t) => t.type === 'inference:failed'),
+      'an abandoned turn is not first recorded as a provider failure');
     const lifecycle = traces
       .filter((t) => String(t.type).includes('lifecycle'))
       .map((t) => (t as { phase?: string }).phase);
     if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
+  });
+});
+
+/** The `error` of each inference-log row the framework writes, in order. */
+function watchInferenceLog(framework: AgentFramework): string[] {
+  const logged: string[] = [];
+  const logs = framework as unknown as { logInference(entry: { error?: string }): void };
+  const logInference = logs.logInference.bind(framework);
+  logs.logInference = (entry) => { logged.push(entry.error ?? '(no error)'); logInference(entry); };
+  return logged;
+}
+
+test('an abandoned turn writes one inference-log row, attributed to the abandon', async () => {
+  // Every other terminal of a stream writes an inference-log row, the
+  // abandon's `error` twin included, so the log can attribute it later.
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
+  });
+});
+
+test("an abandon stops the agent's running code_execution script with the turn", async () => {
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const scriptAborts: string[] = [];
+    (framework as unknown as { codeExecutionRunners: Map<string, unknown> }).codeExecutionRunners.set('agent', {
+      busy: true,
+      abort: (reason: string) => { scriptAborts.push(reason); },
+      dispose: () => {},
+    });
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.deepEqual(scriptAborts, ['turn abandoned by quiesce']);
+  });
+});
+
+test('an abandon whose stream just closes still settles the turn as an operator abort', async () => {
+  // A stream implementation may answer cancel() by just closing its
+  // iterator, with no `aborted` or `error` event. The abandon still ends the
+  // turn as its twins do: the agent back to idle, one inference:aborted with
+  // the abandon's reason, one log row, and no failure accounting.
+  class ClosingHangStream extends HangingStream {
+    override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      await this.waitForCancel();
+    }
+  }
+  class ClosingMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new ClosingHangStream();
+    }
+  }
+  const membrane = new ClosingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    const logged = watchInferenceLog(framework);
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    const aborted = traces.filter((t) => t.type === 'inference:aborted').map((t) => (t as { reason?: string }).reason);
+    assert.deepEqual(aborted, ['quiesce_abandoned']);
+    assert.ok(!traces.some((t) => t.type === 'inference:exhausted' || t.type === 'inference:failed'),
+      'an operator cancel must not feed the failure accounting');
+    assert.deepEqual(logged, ['Stream aborted: quiesce_abandoned']);
   });
 });
 
@@ -1149,6 +1499,59 @@ test('boot recovery restores a recovery file that predates seq in file order, an
     const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
       .map((m) => (m.content[0] as { text: string }).text);
     assert.deepEqual(texts, ['third', 'first', 'second']);
+  } finally {
+    console.error = error;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('boot recovery numbers the restored queue 1..N, so after a seq at Number.MAX_SAFE_INTEGER each deferral still gets a seq of its own', { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-seq-limit-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  const add = (fw: AgentFramework, text: string) =>
+    (fw as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage('user', [{ type: 'text', text }]);
+  let framework = await AgentFramework.create(config());
+  const lines: string[] = [];
+  const error = console.error;
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    add(framework, 'first');
+    await framework.stop();
+
+    // A seq at the limit, as damage or a hand edit could leave it. It is a
+    // valid seq, so boot names nothing and has no reason to rewrite the file.
+    const file = join(storePath, 'recovery', 'deferred-writes.json');
+    const doc = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<Record<string, unknown>> };
+    assert.equal(doc.pending.length, 1);
+    doc.pending[0]!.seq = Number.MAX_SAFE_INTEGER;
+    const edited = JSON.stringify(doc);
+    writeFileSync(file, edited);
+
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    framework = await AgentFramework.create(config());
+    assert.equal(readFileSync(file, 'utf8'), edited, "boot doesn't rewrite a file whose seqs are all valid");
+    add(framework, 'second');
+    add(framework, 'third');
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as { pending: Array<{ seq: unknown; content: Array<{ text: string }> }> };
+    assert.deepEqual(persisted.pending.map((m) => [m.content[0]!.text, m.seq]), [['first', 1], ['second', 2], ['third', 3]],
+      'numbered 1..N at boot, and the deferrals after it go on from N');
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    console.error = error;
+    assert.ok(!lines.some((line) => line.includes('has seq')), `every seq the next boot reads is valid:\n${lines.join('\n')}`);
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['first', 'second', 'third']);
   } finally {
     console.error = error;
     await framework.stop();

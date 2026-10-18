@@ -1,6 +1,7 @@
 import type { ProcessEvent } from './events.js';
 import type { ModuleProcessResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
+import type { DraftReason } from '../prose-drafts.js';
 
 /**
  * Base for all trace events.
@@ -55,6 +56,12 @@ export type TraceEvent =
       silent?: boolean;
     })
   | (TraceEventBase & {
+      /**
+       * The model answered and the turn ended: with the stream's final
+       * response, or with a tool result carrying `endTurn`, which
+       * `inference:turn_ended` then follows. `tokenUsage` is the stream's
+       * usage, cumulative across its rounds.
+       */
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
@@ -66,11 +73,13 @@ export type TraceEvent =
       /** How long this start of the turn ran; after a context-budget restart, from the restart. */
       durationMs: number;
       /**
-       * Why the turn ended unfinished: the reason an operator gave
-       * `abortInference`, `'quiesce_abandoned'` for a turn an operator quiesce
-       * abandoned, or, for a turn dropped before it sent anything (its agent
-       * replaced or removed, or the framework stopping or restarted), a
-       * sentence saying which.
+       * Why the turn ended unfinished: the reason its canceller gave
+       * `abortInference` or `Agent.cancelStream` (`'user'` when it gave
+       * none), `'shutdown'` for a turn `stop()` cancelled,
+       * `'quiesce_abandoned'` for a turn an operator quiesce abandoned, or,
+       * for a turn dropped before it sent anything (its agent replaced or
+       * removed, or the framework stopping or restarted), a sentence saying
+       * which.
        */
       reason?: string;
     })
@@ -304,7 +313,13 @@ export type TraceEvent =
       messageId?: string;
     })
   /** RFC-006 coalescing decision record (received / displaced / removed /
-   *  rendered / revoked / render-cancelled / late-render / render-failed). */
+   *  rendered / revoked / render-cancelled / late-render / render-failed).
+   *  A late-render whose push/render had already timed out, its fallback
+   *  materialized, is recorded by the connection's wiring rather than the
+   *  coalescer: it names `serverId`, `featureSet`, `key` and, for a
+   *  channel-scoped subject, `channelId` instead of `subject`, carries a late
+   *  JSON-RPC error as `error` (`[code] message`, bounded), and its `eventId`
+   *  links it to the batch's render-failed. */
   | (TraceEventBase & {
       type: 'mcpl:coalescing';
       kind: string;
@@ -455,6 +470,9 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -571,6 +589,47 @@ export type TraceEvent =
       hint: string;
     })
   | (TraceEventBase & {
+      /** An inbound RPC request/notification handler failed: it threw or
+       *  rejected, or it resolved after a reply write of its own failed or
+       *  after it tried to answer a second time. */
+      type: 'mcpl:request-handler-error';
+      serverId: string;
+      /** Connection event name, e.g. channels-register or push-event. */
+      event: string;
+      /** The request's id when it is a number, or a string id bounded as the
+       *  other texts here are: control, format and line-separator characters
+       *  replaced, and cut after 500 code points, with "…" marking the cut.
+       *  Absent for a notification, for a request whose id is neither, and
+       *  for a request form of mcpl/manifestChanged or
+       *  notifications/tools/list_changed, which is answered as it's admitted
+       *  and then handled as the notification is. */
+      requestId?: string | number;
+      /** Whether a reply write of the handler's returned: true once one
+       *  did. On a connection that had already closed, that write dropped
+       *  the reply, as the connection then drops every reply, so nothing
+       *  reached the server. A write that throws, as one that can't be
+       *  encoded does, sends nothing. When it's false and the responder
+       *  can send an error reply (it has respondError), the host sent -32603
+       *  "Internal error" itself, or -32000 while it stops, unless
+       *  `responseError` says that reply failed. A connection that has
+       *  already closed drops that reply, as it drops every reply, with no
+       *  `responseError`. */
+      responseAttempted: boolean;
+      /** The handler's own error when it threw or rejected; otherwise the
+       *  reply write that failed and that it swallowed, or that it tried to
+       *  answer a second time. */
+      error: string;
+      /** A reply write that failed, when the handler then failed with an
+       *  error of its own (which is `error`). */
+      responseFailure?: string;
+      /** What the handler tried to send after a reply was already attempted:
+       *  refused, never written. A result, or an error reply with its code
+       *  and (bounded) message. */
+      refusedResponse?: { kind: 'result' } | { kind: 'error'; code: number; message: string };
+      /** Failure while trying to send the internal-error response. */
+      responseError?: string;
+    })
+  | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
       /** The JSON-RPC id of the late response whose pending request already timed out. */
@@ -581,6 +640,8 @@ export type TraceEvent =
       hadState: boolean;
       /** True when the dropped response carried a server-managed `checkpoint`. */
       hadCheckpoint: boolean;
+      /** A late JSON-RPC error, as `[code] message`, bounded. */
+      error?: string;
     })
 
   // Ops / fleet observability. Everything the framework's opsAlert() escalates
@@ -613,7 +674,7 @@ export type TraceEvent =
       parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
-      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      /** Agents whose turn the abandon had not ended when its grace ran out: a token held with no stream and no check ahead (a puppet tool turn, a store surgery's reservation, a turn finishing its last delivery), or a turn that hadn't reached its next check, the tool-result guard's wait for its speech included. A turn whose stream the abandon cancelled while it was still streaming isn't listed, even one still running when the grace ran out. */
       unabandonable?: string[];
     })
   | (TraceEventBase & {
@@ -748,6 +809,39 @@ export type TraceEvent =
       type: 'gate:held-dropped';
       dropped: number;
       channels: Array<string | undefined>;
+    })
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: DraftReason;
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
 
 /**

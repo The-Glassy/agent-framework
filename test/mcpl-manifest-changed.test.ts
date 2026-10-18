@@ -16,6 +16,7 @@ import { EventEmitter } from 'node:events';
 
 import { AgentFramework } from '../src/framework.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { CapabilityGrant, computeGrant, expandAdvertisementShorthand } from '../src/mcpl/capability-grant.js';
 import type { McplCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
@@ -87,7 +88,9 @@ function makeHarness() {
 
   const connection = new ManifestFake();
   connection.capabilities = expandAdvertisementShorthand(INITIAL);
-  fw.mcplServerRegistry = { getAllServers: () => [connection], getServer: (id: string) => (id === 'srv' ? connection : null) };
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('srv', connection);
+  fw.mcplServerRegistry = registry;
 
   // Model post-§5.3 state: initial policy done, full grant active.
   const grant = computeGrant(connection.capabilities, config, { mcpToolsAdvertised: false });
@@ -95,10 +98,17 @@ function makeHarness() {
   connection.establishGrant(grant);
   connection.events = []; // discard setup noise
 
-  return { fw, connection, traces };
+  return { fw, connection, traces, registry };
 }
 
 const settle = () => new Promise((r) => setImmediate(r));
+
+test('a manifest change from a server with no configuration (removed) fetches nothing', async () => {
+  const { fw, connection } = makeHarness();
+  (fw as unknown as { mcplServerConfigs: Map<string, unknown> }).mcplServerConfigs = new Map();
+  await fw.handleManifestChanged(connection, { revision: 'sha256:gone', domains: ['capabilities'] });
+  assert.deepEqual(connection.events.map((e) => e.kind), [], 'no fetch, grant or policy request');
+});
 
 test('reduction applies BEFORE the policy Request; receipt names it applied', async () => {
   const { fw, connection, traces } = makeHarness();
@@ -176,14 +186,17 @@ test('refusal with fallback mcp-only: empty grant, empty-derived feature state',
   assert.equal(connection.closed, false);
 });
 
-test('refusal with fallback close: the transport is closed', async () => {
-  const { fw, connection } = makeHarness();
+test('refusal with fallback close: the transport is closed and the server unregistered', async () => {
+  const { fw, connection, registry } = makeHarness();
   connection.answerPolicy = 'refuse-close';
   connection.nextManifest = () => INITIAL;
 
   await fw.handleManifestChanged(connection, { revision: 'sha256:r2', domains: ['capabilities'] });
 
   assert.equal(connection.closed, true, 'fallback close must be honored (§6.7)');
+  // The fake's close() emits no 'close', as a server's doesn't once it's down
+  // between retries, so only a close through the registry unregisters it.
+  assert.equal(registry.getServer('srv'), null);
 });
 
 test('failed fetch: previous manifest and grant stand untouched', async () => {

@@ -222,7 +222,7 @@ describe('admission: the hold is decided once, before any side effect', () => {
   });
 
   it('gap 10 / §3.3 — without a reader, tune-out is a silent hold that still releases', async () => {
-    const f = await fixture();
+    const f = await fixture({ framework: { tuneOut: { enabled: true } } as Partial<FrameworkConfig> });
     try {
       await registerOpen(f, 'noisy');
       const coordinator = internals(f).tuneOutCoordinator;

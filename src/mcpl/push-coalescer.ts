@@ -129,11 +129,20 @@ interface Rendering<E> {
 
 /** What an assembly did, per subject, for the turn being assembled. */
 export interface AssemblyResult {
-  /** Subjects whose render this assembly waited on to completion. */
+  /** Subjects this assembly finished with: it waited on their render to
+   *  completion, freeze() declined them for this agent, or they were among
+   *  the turn's causes and their batch was gone or another assembly's. */
   settled: Set<string>;
-  /** Of those, the subjects whose render or fallback was delivered as content.
-   *  A settled subject that is not here gave the turn nothing to read: empty
-   *  or blank render (§5.2), cancelled, or revoked at response. */
+  /** Of those, the subjects whose render or fallback this assembly delivered
+   *  where its compile reads it, as content the turn reads as its own. A
+   *  settled subject that is not here gave the turn nothing new of its own to
+   *  read: empty or blank render (§5.2), cancelled, revoked before the render
+   *  or at its response, a render-start that could not be made durable (the
+   *  batch then waits for its recovery wake), a batch whose audience doesn't
+   *  include the agent, a render placed in another agent's deferred queue, a
+   *  render another assembly froze (its compile may show it, as that
+   *  request's), or a cause whose batch was withdrawn, displaced or consumed
+   *  by another request. */
   materialized: Set<string>;
 }
 
@@ -189,6 +198,11 @@ export interface CoalescerHost<E> {
   deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
+  /** Queue an ordinary push wake for `agent`, under the batch's own wake
+   *  policy, to read a render of the batch placed in its deferred queue that
+   *  no request consumed. It carries no subject, so the subject's other wakes,
+   *  and later withdrawals of them, leave it. */
+  wakeToRead(occurrence: CoalescedOccurrence<E>, agent: string): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
   /** The batch's audience still holds the authority it was admitted under. */
@@ -205,7 +219,12 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
-  /** Make every write so far DURABLE (fsync, group-committed by the host).
+  /** One call per ADMITTED occurrence (never for a producer retry the receipt
+   *  deduplicates), after its receipt is recorded. Observation only: a throw
+   *  is contained here and never fails the acceptance. */
+  accepted?(occurrence: CoalescedOccurrence<E>): void;
+  /** Make every write so far DURABLE (an fsync; the coalescer requests each
+   *  commit under its lock, so no two acceptances share one).
    *  Awaited before an acceptance is acknowledged and before push/render is
    *  issued: a kill after either boundary must find the receipt, the
    *  accepted work, and the render-start on disk. Rejects on failure. */
@@ -245,15 +264,21 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  * Validate wire content before it is stored, rendered or converted.
  *
  * Its shape and its visible emptiness, nothing else. An incoming coalesced
- * occurrence reaches context through the converters an uncoalesced message
+ * occurrence reaches context through the converter an uncoalesced message
  * goes through: a plain occurrence the moment it is admitted (the coalescer
  * only remembers where it landed), a deferred one when its render settles or
  * falls back to it. Its content must be an array of objects. A block the
- * converters can't render (a video, an unknown type, an image with neither
+ * converter can't render (a video, an unknown type, an image with neither
  * uri nor data) becomes a placeholder, as it does uncoalesced, and so does a
- * malformed one, since the converters take any object without throwing: a
- * type, text, data, mimeType or uri that isn't a string counts as absent, a
- * text block's as no text. The uncoalesced lane doesn't check the array:
+ * malformed one, since the converter takes any object without throwing: a
+ * type, data, mimeType or uri that isn't a string counts as absent, and a
+ * text block whose text isn't a string shows as its own placeholder, which
+ * counts as no text where MCPL content is admitted: here, on the wire blocks,
+ * and at the uncoalesced boundaries, through isVisiblyEmptyConversion. The
+ * framework's backstops read converted content with isVisiblyEmptyContent,
+ * which would count the placeholder as text, but they see only content one of
+ * those checks has passed. The uncoalesced
+ * lane doesn't check the array:
  * there a member that isn't an object becomes the untyped placeholder, and a
  * null member or content that isn't an array throws in conversion
  * (agent-framework#297 brings that lane to this rule).
@@ -265,8 +290,8 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  *
  * A render result, which the host delivers in the occurrence's place, gets
  * these checks, as RFC-006 §5.2 gives it every check a pushed payload gets,
- * and one more (`checkBlockShapes`): each block must be one the converters
- * show as itself or as a reference stub, not as a placeholder. A malformed
+ * and one more (`checkBlockShapes`): each block must be one the converter
+ * shows as itself or as a reference stub, not as a placeholder. A malformed
  * render falls back to the occurrence's own content; a pushed payload has
  * nothing to fall back to, and gets its placeholders.
  *
@@ -289,12 +314,12 @@ export function validateCoalescedContent(
 }
 
 /**
- * Whether the converters (`convertBlock` in push-handler.ts and
- * channel-registry.ts) show a block as itself, its text or its image or
+ * Whether the converter (`convertBlock` in convert-block.ts, which every lane
+ * uses) shows a block as itself, its text or its image or
  * audio source, or as a reference stub, and not as a placeholder: an
- * unrecognized block, a no-data or no-media-type one, or withheld inline
- * data. A text block whose text isn't a string, which they show as no text,
- * is refused too. This follows their branches in their order.
+ * unrecognized block, a no-data or no-media-type one, withheld inline data,
+ * or a text block whose text isn't a string. This follows its branches in
+ * their order.
  */
 function showsAsItself(b: Record<string, unknown>): boolean {
   if (b.type === 'text') return typeof b.text === 'string';
@@ -485,6 +510,11 @@ export class PushCoalescer<E = unknown> {
       throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
     }
     this.receipts.set(receiptKey, entry);
+    try {
+      this.host.accepted?.(occurrence);
+    } catch (error) {
+      this.host.audit({ kind: 'accepted-observer-failed', subject, eventId: occurrence.eventId, error: String(error) });
+    }
     this.prune();
     this.persist();
     // Written but not yet durable: the in-memory receipt deduplicates a retry
@@ -655,22 +685,32 @@ export class PushCoalescer<E = unknown> {
    * `agentName`. Called by the host at a turn's assembly boundary, before the
    * compile. Bounded by the host's render timeout; a failed or late render
    * materializes the admitted fallback (§5.3). Reports which subjects
-   * settled and which of them produced content, so the host can tell a turn
-   * whose only cause rendered nothing.
+   * settled and which of them gave the turn content, so the host can tell a
+   * turn whose only causes gave it nothing to read.
+   *
+   * `causes` are the subjects whose batch wakes started the turn. A batch has
+   * one consumer, the request it was frozen for (§5.2: the materialized
+   * occurrence is consumed by that request). So a cause whose batch is gone
+   * by now settles and gives the turn nothing, and an assembly that joins
+   * another's render waits for it, so its compile shows the content, without
+   * taking it as its own.
    */
-  async assemble(agentName: string): Promise<AssemblyResult> {
+  async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
     const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
-    for (const subject of [...this.subjects.keys()]) {
+    const wanted = new Set(causes);
+    for (const subject of new Set([...this.subjects.keys(), ...causes])) {
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
-      const started = await this.locked(() => this.freeze(subject, agentName));
-      if (started) {
+      const started = await this.locked(() => this.freeze(subject, agentName, wanted.has(subject)));
+      if (started === 'declined') result.settled.add(subject);
+      else if (started) {
         work.push(started.done.then(() => {
           result.settled.add(subject);
-          if (started.rendering.materialized) result.materialized.add(subject);
+          // A render another assembly froze is that request's to read.
+          if (started.rendering.materialized && !started.joined) result.materialized.add(subject);
         }));
       }
     }
@@ -682,28 +722,56 @@ export class PushCoalescer<E = unknown> {
   /**
    * Under the lock: decide whether `subject`'s batch renders for `agentName`,
    * freeze it, make the render-start durable, re-check authority, and start
-   * the RPC. Returns the render's completion (shared by every assembly that
-   * waits on this batch, vector 25) or undefined when nothing was started.
+   * the RPC. Returns the render's completion, which an assembly that joins
+   * the render waits for too (`joined`: vector 25, one render). Returns
+   * 'declined' when the turn being assembled gets nothing of the batch: the
+   * agent isn't in its audience, whether or not another assembly is
+   * rendering it (the batch is left as it is); authority was revoked before
+   * the render could start (the batch is dropped); the render-start could not
+   * be made durable (the batch is kept for its recovery wake); or, for one of
+   * the turn's causes (`cause`), the batch is gone. Returns undefined when
+   * the batch was not this assembly's to decide on: there is none and it
+   * wasn't a cause, the subject moved on during the audience lookup, or the
+   * host is stopping.
    */
-  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void>; rendering: Rendering<E> } | undefined> {
+  private async freeze(subject: string, agentName: string, cause = false): Promise<{ done: Promise<void>; rendering: Rendering<E>; joined?: true } | 'declined' | undefined> {
+    if (this.suspended) return undefined;
     const state = this.subjects.get(subject);
-    if (!state || this.suspended) return undefined;
+    // The batch whose wake started this turn is gone: a retraction or a
+    // displacement withdrew it after the wake was dispatched, or another
+    // request consumed it, the batch's one consumption, as the freeze's
+    // withdrawal of the other queued wakes already makes it. Whatever replaced
+    // it is read through its own delivery and wake. (A retry of a turn that
+    // read its batch comes back without the marks of a batch wake, so it
+    // never reaches here as a cause: beginAgentTurn.)
+    if (!state || (!state.batch && !state.rendering)) return cause ? 'declined' : undefined;
     if (state.rendering) {
-      // Another assembly froze this batch; share its outcome (vector 25).
+      // Another assembly froze this batch, and the request it assembles
+      // consumes it. An assembly in its audience waits for that render, so
+      // its compile shows the content (vector 25), but the content isn't its
+      // own to read, cause or not; unless this agent isn't in its audience,
+      // as below.
       const rendering = state.rendering;
-      return (await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done, rendering } : undefined;
+      const audience = await this.host.audience(rendering.batch.latest);
+      if (state.rendering !== rendering) return undefined;
+      if (!audience.includes(agentName)) return 'declined';
+      return { done: rendering.done, rendering, joined: true };
     }
     const batch = state.batch;
     if (!batch) return undefined;
     // The audience lookup may spawn a fork. Under the lock no admission can
     // move the subject on meanwhile; the identity check guards the host.
     const audience = await this.host.audience(batch.latest);
-    if (!audience.includes(agentName) || state.batch !== batch || state.rendering) return undefined;
+    if (state.batch !== batch || state.rendering) return undefined;
+    // Not this agent's batch, or no longer: an agent woken for it can have left
+    // its audience since. This turn has nothing of it to show. The batch stays
+    // pending; nothing here wakes its current audience.
+    if (!audience.includes(agentName)) return 'declined';
     state.batch = undefined;
     this.host.cancelWake(subject);
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
-      return undefined;
+      return 'declined';
     }
     const rendering: Rendering<E> = { batch, cancelled: false, done: Promise.resolve() };
     state.rendering = rendering;
@@ -721,7 +789,7 @@ export class PushCoalescer<E = unknown> {
       // unrelated traffic happens by. Re-wake with backoff, so a persistent
       // storage outage does not become a tight loop of model turns.
       this.scheduleRecovery(subject, state);
-      return undefined;
+      return 'declined';
     }
     this.clearRecovery(subject);
     if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
@@ -731,7 +799,7 @@ export class PushCoalescer<E = unknown> {
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
       state.rendering = undefined;
-      return undefined;
+      return 'declined';
     }
     rendering.done = this.render(subject, state, rendering, agentName);
     return { done: rendering.done, rendering };
@@ -788,15 +856,21 @@ export class PushCoalescer<E = unknown> {
         this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty });
         if (empty) return; // §5.2: nothing happened (blank text included)
         const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
-        rendering.materialized = true;
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
-          // unread there, so it stays replaceable and withdrawable.
+          // unread there, so it stays replaceable and withdrawable. The turn
+          // being assembled doesn't read it, so it isn't materialized for that
+          // turn, and no request has consumed it. The freeze withdrew the
+          // queue's agent's wake for this batch; give it an ordinary wake, as
+          // any delivery during its turn has, beside any wakes a newer batch
+          // has, so that its next turn reads the content.
           state.occupant = { eventId: occurrence.eventId, placement };
           state.audienceAgent = placement.agent;
+          await this.host.wakeToRead(occurrence, placement.agent);
           return;
         }
         // The materialized occurrence is consumed by the request being assembled.
+        rendering.materialized = true;
         state.history = 'some';
         state.consumedEventId = occurrence.eventId;
         state.occupant = undefined;

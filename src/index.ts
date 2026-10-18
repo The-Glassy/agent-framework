@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, AgentStoppedError, BudgetPreflightError, ProviderWaitNotSleptError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, AgentStoppedError, BudgetPreflightError, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -77,6 +77,7 @@ export type {
   ExecResult,
   PyRunnerOptions,
   ScriptToolCallHandler,
+  ScriptToolResult,
 } from './code-execution/index.js';
 export type { SessionUsage, AgentUsage, SessionUsageSnapshot, UsageUpdatedEvent } from './usage/index.js';
 
@@ -87,14 +88,36 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// Where each accepted inbound item came from (`metadata.inboundSource`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './mcpl/index.js';
+
 // MCPL server config (exposed for hosts that manage servers at runtime via
 // connectMcplServer / disconnectMcplServer / restartMcplServer)
 export type { McplServerConfig } from './mcpl/index.js';
 
-// MCPL client connection (exposed so external tooling — server playtests,
-// health probes, protocol harnesses — can dial an MCPL server exactly the
-// way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
+// Both engines' client connections, and the configuration helpers and
+// protocol revisions they share (exposed so external tooling, such as server
+// playtests, health probes and protocol harnesses, can reach a server
+// exactly the way the framework host does: MCPL over stdio or WebSocket, and
+// modern MCP over stdio or Streamable HTTP)
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+export { ModernMcpConnection } from './mcpl/index.js';
+export type { ModernToolCallResult } from './mcpl/index.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  resolveServerBinding,
+  serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
+} from './mcpl/index.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './mcpl/index.js';
 export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
@@ -172,6 +195,7 @@ export {
 export {
   SILENT_HEARTBEAT_SEPARATOR,
   silentHeartbeatOf,
+  type RequestOnlyPrompt,
   type SilentHeartbeatStamp,
   type SilentHeartbeatTick,
 } from './silent-heartbeat.js';

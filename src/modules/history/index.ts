@@ -215,9 +215,13 @@ const SEMANTIC_DEFAULT_LIMIT = 10;
 const SEMANTIC_MAX_LIMIT = 50;
 /** Largest k sent to the embed-service when over-fetching past dropped hits (its own cap is 200). */
 const SEMANTIC_MAX_FETCH = 200;
-/** Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text. */
+/**
+ * Local snippet: the leading SEMANTIC_SNIPPET_CHARS of the current text, one
+ * fewer where the last would split a surrogate pair, since the snippet reaches
+ * the agent's context.
+ */
 function snippetOf(text: string): string {
-  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${text.slice(0, SEMANTIC_SNIPPET_CHARS)}…`;
+  return text.length <= SEMANTIC_SNIPPET_CHARS ? text : `${safeSlice(text, 0, SEMANTIC_SNIPPET_CHARS)}…`;
 }
 const SEMANTIC_SNIPPET_CHARS = 400;
 
@@ -1682,7 +1686,7 @@ export class HistoryModule implements Module {
       if (msgId !== undefined) {
         const m = cm.getMessage(msgId);
         if (!m) return 'offBranch';
-        const text = messageIndexText(m, includePrivate).slice(0, this.semanticCfg!.maxChars ?? 32_000);
+        const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
         if (!text) return 'stale';
         currentText.set(h.id, text);
         return 'ok';
@@ -1776,7 +1780,7 @@ export class HistoryModule implements Module {
           lastError: this.indexer?.lastError ?? null,
           /** Hits the index returned for messages/summaries not on the current branch (undone, checked out past). */
           droppedOffBranch,
-          /** Hits for messages whose current text has nothing indexable (edited blank; the index delete is pending). */
+          /** Hits for messages whose current text has nothing indexable (edited blank; the index keeps such a message until its delete goes through, and on a service without /delete it never does). */
           droppedStale,
           /** When too few hits were on this branch and searching again for more failed: why, and whether calling again can help. */
           searchAgainError,
@@ -2463,7 +2467,9 @@ function codePointBefore(s: string, i: number): string | undefined {
 }
 
 /**
- * First occurrence of `needle` in `text`. With `wholeWord`, an occurrence
+ * First occurrence of `needle` in `text`, as the units of `text` it covers.
+ * Without `caseSensitive`, `needle` is lower case already, and is found in
+ * `text.toLowerCase()`. With `wholeWord`, an occurrence
  * only counts when it isn't glued to a letter/digit/underscore on either
  * side (Unicode-aware, so Cyrillic words work too) — "mission" no longer
  * hits inside "uncommissioned". Word-ness is checked only on the sides
@@ -2472,6 +2478,13 @@ function codePointBefore(s: string, i: number): string | undefined {
  */
 function matchSubstring(text: string, needle: string, caseSensitive: boolean, wholeWord = false): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
+  const hit = firstOccurrence(haystack, needle, wholeWord);
+  // Lowering can lengthen a character, as it does `İ` (one unit to two). Then
+  // the lowered text's units aren't the text's, and the snippet cuts the text.
+  return hit !== null && haystack.length !== text.length ? inTextUnits(text, hit) : hit;
+}
+
+function firstOccurrence(haystack: string, needle: string, wholeWord: boolean): MatchHit | null {
   if (!wholeWord) {
     const index = haystack.indexOf(needle);
     return index === -1 ? null : { index, length: needle.length };
@@ -2487,6 +2500,26 @@ function matchSubstring(text: string, needle: string, caseSensitive: boolean, wh
     }
     from = index + 1;
   }
+}
+
+/**
+ * The units of `text` that a hit in `text.toLowerCase()` covers. Each code
+ * point of `text` takes as many units there as its own lower case has, so a
+ * hit that starts or ends inside a character's lower case takes in the whole
+ * character.
+ */
+function inTextUnits(text: string, hit: MatchHit): MatchHit {
+  const end = hit.index + hit.length;
+  let start = -1;
+  let lowered = 0;
+  let at = 0;
+  while (at < text.length && lowered < end) {
+    const cp = text.codePointAt(at)!;
+    lowered += String.fromCodePoint(cp).toLowerCase().length;
+    if (start === -1 && lowered > hit.index) start = at;
+    at += cp > 0xffff ? 2 : 1;
+  }
+  return { index: start, length: at - start };
 }
 
 // ============================================================================
@@ -2588,12 +2621,12 @@ function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec 
 /** ~SNIPPET_CONTEXT_CHARS of surrounding context on each side of a match, or
  *  the first ~SNIPPET_FALLBACK_CHARS of content when no meaningful match
  *  position is given (kept simple on purpose — this is a readability aid,
- *  not a highlighting engine). */
+ *  not a highlighting engine). Neither end splits a surrogate pair. */
 function snippetAround(text: string, index: number, length: number): string {
-  if (index < 0) return text.slice(0, SNIPPET_FALLBACK_CHARS);
+  if (index < 0) return safeSlice(text, 0, SNIPPET_FALLBACK_CHARS);
   const start = Math.max(0, index - SNIPPET_CONTEXT_CHARS);
   const end = Math.min(text.length, index + length + SNIPPET_CONTEXT_CHARS);
   const prefix = start > 0 ? '…' : '';
   const suffix = end < text.length ? '…' : '';
-  return prefix + text.slice(start, end) + suffix;
+  return prefix + safeSlice(text, start, end) + suffix;
 }

@@ -146,15 +146,16 @@ never do.
   `Unreleased` above, and refuses to release when there is nothing to
   release; npm then commits and tags. `git push --follow-tags` triggers CI,
   which refuses a tag with no matching changelog section, checks in a job
-  of its own that the packed release installs on its own
-  (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
-  alone into an empty directory with its dependencies from npm, nested so
-  the package reaches only its own, and checks the installed package, as
-  the script's header lists; to run it by hand, `npm run build` first, for
-  example before `git push --follow-tags`, or dispatch the workflow on a
-  branch, where it publishes nothing), publishes
+  of its own that the packed release installs on its own, publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
-  creates the GitHub release with that section as its notes. The two
+  creates the GitHub release with that section as its notes. The check,
+  `node scripts/pack-installs-alone.mjs`, packs the release and installs
+  the tarball alone into an empty directory with its dependencies from
+  npm. The install is linked, so each package reaches only the
+  dependencies it declares. It then checks the installed package, as the
+  script's header lists. To run it by hand, run `npm run build` first,
+  for example before `git push --follow-tags`, or dispatch the workflow on
+  a branch, where it publishes nothing. The two
   release jobs are independent: some consumers run github-clone checkouts,
   so release notes must exist even when npm publish fails. Both need the
   build job, so a failed build stops both; past it, so do a tag with no
@@ -201,13 +202,18 @@ never do.
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test dist/test/*.test.js
+npm test              # node --test --test-force-exit --test-timeout=600000 dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 
 `npm test` runs the compiled output, so a stale `dist/` will happily test
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
+
+`--test-timeout=600000` bounds each test file as a whole under Node 20,
+and each test under Node 24, at ten minutes; the slowest file,
+`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
+a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI
