@@ -5393,7 +5393,7 @@ export class AgentFramework {
     // A publish under way ends its own stream by its outcome, or the cancel
     // below once the waits are over.
     this.speculativeClosed = true;
-    for (const streams of this.speculativeStreams) step(() => this.forgetSpeculativeCalls(streams.cancelPending()));
+    for (const streams of this.speculativeStreams ?? []) step(() => this.forgetSpeculativeCalls(streams.cancelPending()));
     this.running = false;
     // Bounded work this stop cuts off is neither finished nor failed. Its
     // record stays live in the snapshot, so the next boot ends it as
@@ -5586,9 +5586,9 @@ export class AgentFramework {
     for (const complete of [...this.pendingOutgoingCompletes]) step(complete);
     // Speculative streams end the same way, cancelled: nothing they carried
     // is published now.
-    for (const streams of new Set([...this.speculativeStreams, ...this.speculativeCalls.values()])) step(() => streams.cancelAll());
-    this.speculativeStreams.clear();
-    this.speculativeCalls.clear();
+    for (const streams of new Set([...this.speculativeStreams ?? [], ...this.speculativeCalls?.values() ?? []])) step(() => streams.cancelAll());
+    this.speculativeStreams?.clear();
+    this.speculativeCalls?.clear();
 
     // A restart ends every conversation fork still live: the router's
     // bindings are in memory, and its generation counters are persisted so
@@ -22181,19 +22181,20 @@ export class AgentFramework {
       chunk: (to, streamId, seq, content) => registry.sendSpeculativeChunk(to, agent.name, streamId, seq, content),
       complete: (to, streamId, content, cancelled) => registry.sendSpeculativeComplete(to, agent.name, streamId, content, cancelled),
     });
-    this.speculativeStreams.add(streams);
+    // (Optional chaining: prototype-built harnesses leave the maps unset.)
+    this.speculativeStreams?.add(streams);
     return streams;
   }
 
   private forgetSpeculativeCalls(callIds: string[]): void {
-    for (const id of callIds) this.speculativeCalls.delete(id);
+    for (const id of callIds) this.speculativeCalls?.delete(id);
   }
 
   /** A call's result arrived: a speculative stream it still has is cancelled. */
   private settleSpeculativeCall(callId: string): void {
-    const streams = this.speculativeCalls.get(callId);
+    const streams = this.speculativeCalls?.get(callId);
     if (!streams) return;
-    this.speculativeCalls.delete(callId);
+    this.speculativeCalls?.delete(callId);
     streams.settle(callId);
   }
 
@@ -24927,7 +24928,7 @@ export class AgentFramework {
             const calls = event.calls.map(asCalled);
             if (speculative) {
               speculative.onToolCalls(calls);
-              for (const c of calls) if (speculative.has(c.id)) this.speculativeCalls.set(c.id, speculative);
+              for (const c of calls) if (speculative.has(c.id)) this.speculativeCalls?.set(c.id, speculative);
             }
             // A tool-call response is a clean physical round: admit its
             // preceding results before storing/dispatching this new round.
@@ -26559,7 +26560,7 @@ export class AgentFramework {
       // cancelled. A publish under way ends its own.
       if (speculative) {
         this.forgetSpeculativeCalls(speculative.cancelPending());
-        this.speculativeStreams.delete(speculative);
+        this.speculativeStreams?.delete(speculative);
       }
       // The accounting writes to the store, and a write that fails must not
       // skip the teardown after it.
@@ -36132,11 +36133,11 @@ export class AgentFramework {
       : call.input;
     // A publish whose text went out ahead of it in a speculative stream
     // carries the stream's id, and its outcome ends the stream.
-    const speculative = call.name === 'channel_publish' ? this.speculativeCalls.get(call.id) : undefined;
+    const speculative = call.name === 'channel_publish' ? this.speculativeCalls?.get(call.id) : undefined;
     const speculativeStream = speculative?.dispatch(call.id);
     const endSpeculative = (outcome: { delivered: boolean; destination?: ChannelRef }) => {
       if (!speculative) return;
-      if (this.speculativeCalls.get(call.id) === speculative) this.speculativeCalls.delete(call.id);
+      if (this.speculativeCalls?.get(call.id) === speculative) this.speculativeCalls?.delete(call.id);
       speculative.published(call.id, outcome);
     };
     this.channelRegistry!.handleChannelToolCall(call.name, channelInput, {
